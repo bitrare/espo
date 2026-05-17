@@ -8,8 +8,8 @@ use crate::modules::essentials::storage::{
     RpcGetAlkaneInfoParams, RpcGetAlkaneLatestTracesParams, RpcGetAlkaneTxSummaryParams,
     RpcGetAllAlkanesParams, RpcGetBlockSummaryParams, RpcGetBlockTracesParams,
     RpcGetCirculatingSupplyParams, RpcGetHoldersCountParams, RpcGetHoldersParams, RpcGetKeysParams,
-    RpcGetMempoolTracesParams, RpcGetOutpointBalancesParams, RpcGetTotalReceivedParams,
-    RpcGetTransferVolumeParams, RpcPingParams,
+    RpcGetKnownMarketplacesParams, RpcGetMempoolTracesParams, RpcGetOutpointBalancesParams,
+    RpcGetTotalReceivedParams, RpcGetTransferVolumeParams, RpcGetTxTypesParams, RpcPingParams,
 };
 use crate::runtime::mempool::current_mempool_memory_stats;
 use serde_json::{Value, json};
@@ -544,6 +544,7 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                         };
                         let params = RpcGetBlockTracesParams {
                             height: payload.get("height").and_then(|v| v.as_u64()),
+                            hide_diesel_mints: payload.get("hide_diesel_mints").and_then(|v| v.as_bool()),
                         };
                         view.rpc_get_block_traces(params)
                             .map(|resp| resp.value)
@@ -675,6 +676,8 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                             height: payload.get("height").and_then(|v| v.as_u64()),
                             page: payload.get("page").and_then(|v| v.as_u64()),
                             limit: payload.get("limit").and_then(|v| v.as_u64()),
+                            hide_diesel_mints: payload.get("hide_diesel_mints").and_then(|v| v.as_bool()),
+                            tx_type: payload.get("tx_type").and_then(|v| v.as_str()).map(|s| s.to_string()),
                         };
                         view.rpc_get_alkane_block_txs(params)
                             .map(|resp| resp.value)
@@ -820,6 +823,48 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                         view.rpc_ping(RpcPingParams)
                             .map(|resp| resp.value)
                             .unwrap_or_else(|_| Value::String("pong".to_string()))
+                    }
+                })
+                .await;
+        });
+    }
+
+    {
+        let reg_marketplaces = reg.clone();
+        let mdb_marketplaces = Arc::clone(&mdb);
+        tokio::spawn(async move {
+            reg_marketplaces
+                .register("get_known_marketplaces", move |_cx, payload| {
+                    let mdb = Arc::clone(&mdb_marketplaces);
+                    async move {
+                        let view = match resolve_view(mdb.as_ref(), &payload) {
+                            Ok(v) => v,
+                            Err(err) => return err,
+                        };
+                        view.rpc_get_known_marketplaces(RpcGetKnownMarketplacesParams)
+                            .map(|resp| resp.value)
+                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                    }
+                })
+                .await;
+        });
+    }
+
+    {
+        let reg_tx_types = reg.clone();
+        let mdb_tx_types = Arc::clone(&mdb);
+        tokio::spawn(async move {
+            reg_tx_types
+                .register("get_tx_types", move |_cx, payload| {
+                    let mdb = Arc::clone(&mdb_tx_types);
+                    async move {
+                        let view = match resolve_view(mdb.as_ref(), &payload) {
+                            Ok(v) => v,
+                            Err(err) => return err,
+                        };
+                        view.rpc_get_tx_types(RpcGetTxTypesParams)
+                            .map(|resp| resp.value)
+                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
                     }
                 })
                 .await;

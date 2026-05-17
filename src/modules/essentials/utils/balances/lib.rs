@@ -17,11 +17,11 @@ use crate::modules::ammdata::storage::{AmmDataTable, SearchIndexField};
 use crate::modules::ammdata::utils::search::collect_search_prefixes;
 use crate::modules::essentials::storage::{
     AddressActivityEntry, AddressAmountEntry, AddressIndexListKind, AlkaneBalanceTxEntry,
-    AlkaneTxSummary, BalanceEntry, HolderEntry, HolderId,
+    AlkaneTxSummary, BalanceEntry, HolderEntry, HolderId, TxType, TxMarketplaceInfo,
     address_index_list_id_alkane_balance_txs_by_token, address_index_list_id_alkane_block_txs,
     append_address_index_values, build_outpoint_pos_versioned_puts,
-    build_outpoint_spent_versioned_puts, build_tx_pos_versioned_puts, decode_balances_vec,
-    decode_outpoint_pointer_blob_v3, decode_pointer_idx_u64, decode_u128_value,
+    build_outpoint_spent_versioned_puts, build_tx_pos_versioned_puts, classify_transaction,
+    decode_balances_vec, decode_outpoint_pointer_blob_v3, decode_pointer_idx_u64, decode_u128_value,
     encode_outpoint_pointer_blob_v3, encode_pointer_idx_u64, encode_tx_pointer_blob_v3,
     encode_u128_value, encode_vec, get_holders_count_encoded, mk_outpoint, resolve_outpoint_id_v2,
     resolve_outpoint_ids_batch_v2, resolve_outpoint_spent_by_id_v2,
@@ -1770,12 +1770,15 @@ pub fn bulk_update_balances_for_block(
 
         let is_alkane_tx = has_alkane_vin || has_traces;
         if is_alkane_tx {
+            // Collect output addresses and values for classification
+            let mut output_addresses: Vec<(String, u64)> = Vec::new();
             for output in &tx.output {
                 if is_op_return(&output.script_pubkey) {
                     continue;
                 }
                 if let Some(addr) = spk_to_address_str(&output.script_pubkey, network) {
-                    tx_addrs.insert(addr);
+                    tx_addrs.insert(addr.clone());
+                    output_addresses.push((addr, output.value.to_sat()));
                 }
             }
 
@@ -1800,11 +1803,16 @@ pub fn bulk_update_balances_for_block(
                 Vec::new()
             };
 
+            // Classify the transaction
+            let classification = classify_transaction(&traces, &output_addresses);
+
             alkane_tx_summaries.push(AlkaneTxSummary {
                 txid: txid_bytes,
                 traces,
                 outflows,
                 height: block.height,
+                tx_type: classification.tx_type,
+                marketplace_info: classification.marketplace_info,
             });
             alkane_block_txids.push(txid_bytes);
             for addr in &tx_addrs {
@@ -2789,6 +2797,8 @@ pub fn bulk_update_balances_for_block(
             summary.height,
             &summary.traces,
             &packed,
+            summary.tx_type,
+            summary.marketplace_info.clone(),
         ) else {
             continue;
         };

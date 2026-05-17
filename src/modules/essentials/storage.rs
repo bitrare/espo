@@ -42,6 +42,179 @@ use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Instant;
 
 const ADDRESS_V2_PREFIX: &[u8] = b"/address/v2/";
+
+fn parse_u128_from_str(s: &str) -> Option<u128> {
+    if let Some(hex) = s.strip_prefix("0x") {
+        u128::from_str_radix(hex, 16).ok()
+    } else {
+        s.parse::<u128>().ok()
+    }
+}
+
+fn parse_u32_or_hex(s: &str) -> Option<u32> {
+    if let Some(hex) = s.strip_prefix("0x") {
+        u32::from_str_radix(hex, 16).ok()
+    } else {
+        s.parse::<u32>().ok()
+    }
+}
+
+fn parse_u64_or_hex(s: &str) -> Option<u64> {
+    if let Some(hex) = s.strip_prefix("0x") {
+        u64::from_str_radix(hex, 16).ok()
+    } else {
+        s.parse::<u64>().ok()
+    }
+}
+
+/// Check if a single EspoSandshrewLikeTrace is a diesel mint pattern.
+/// A diesel mint is: contract 2:0, opcode 77 (0x4d), single invoke, all other inputs are 0.
+fn is_diesel_mint_trace_sandshrew(trace: &EspoSandshrewLikeTrace) -> bool {
+    let mut invoke_count = 0usize;
+    let mut contract_block: Option<u32> = None;
+    let mut contract_tx: Option<u64> = None;
+    let mut inputs: Option<&[String]> = None;
+
+    for ev in &trace.events {
+        if let EspoSandshrewLikeTraceEvent::Invoke(data) = ev {
+            invoke_count += 1;
+            if invoke_count > 1 {
+                return false;
+            }
+            contract_block = parse_u32_or_hex(&data.context.myself.block);
+            contract_tx = parse_u64_or_hex(&data.context.myself.tx);
+            inputs = Some(&data.context.inputs);
+        }
+    }
+
+    if invoke_count != 1 {
+        return false;
+    }
+
+    // Must be contract 2:0 (DIESEL token)
+    if contract_block != Some(2) || contract_tx != Some(0) {
+        return false;
+    }
+
+    let Some(inputs) = inputs else {
+        return false;
+    };
+    if inputs.is_empty() {
+        return false;
+    }
+
+    // First input must be opcode 77 (0x4d)
+    let mut iter = inputs.iter();
+    let opcode = iter.next().and_then(|s| parse_u128_from_str(s)).unwrap_or_default();
+    if opcode != 77 {
+        return false;
+    }
+
+    // All remaining inputs must be 0
+    iter.all(|s| parse_u128_from_str(s).map_or(false, |v| v == 0))
+}
+
+/// Check if a tx is a diesel mint (single trace that matches diesel mint pattern).
+fn is_diesel_mint_tx_sandshrew(traces: &[EspoSandshrewLikeTrace]) -> bool {
+    traces.len() == 1 && is_diesel_mint_trace_sandshrew(&traces[0])
+}
+
+/// Detect if a trace JSON value represents a diesel mint transaction.
+/// A diesel mint is: contract 2:0, opcode 77 (0x4d), single invoke, all other inputs are 0.
+fn is_diesel_mint_trace_json(trace: &Value) -> bool {
+    let events = match trace.get("events").and_then(|v| v.as_array()) {
+        Some(e) => e,
+        None => return false,
+    };
+
+    let mut invoke_count = 0;
+    let mut contract_block: Option<u64> = None;
+    let mut contract_tx: Option<u64> = None;
+    let mut inputs: Option<&Vec<Value>> = None;
+
+    for ev in events {
+        if ev.get("event").and_then(|v| v.as_str()) == Some("invoke") {
+            invoke_count += 1;
+            if invoke_count > 1 {
+                return false;
+            }
+            if let Some(data) = ev.get("data") {
+                if let Some(ctx) = data.get("context") {
+                    if let Some(myself) = ctx.get("myself") {
+                        contract_block = myself
+                            .get("block")
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| {
+                                if let Some(hex) = s.strip_prefix("0x") {
+                                    u64::from_str_radix(hex, 16).ok()
+                                } else {
+                                    s.parse().ok()
+                                }
+                            });
+                        contract_tx = myself.get("tx").and_then(|v| v.as_str()).and_then(|s| {
+                            if let Some(hex) = s.strip_prefix("0x") {
+                                u64::from_str_radix(hex, 16).ok()
+                            } else {
+                                s.parse().ok()
+                            }
+                        });
+                    }
+                    inputs = ctx.get("inputs").and_then(|v| v.as_array());
+                }
+            }
+        }
+    }
+
+    if invoke_count != 1 {
+        return false;
+    }
+
+    // Must be contract 2:0 (DIESEL token)
+    if contract_block != Some(2) || contract_tx != Some(0) {
+        return false;
+    }
+
+    let inputs = match inputs {
+        Some(i) => i,
+        None => return false,
+    };
+
+    if inputs.is_empty() {
+        return false;
+    }
+
+    // First input must be opcode 77 (0x4d)
+    let opcode = inputs[0].as_str().and_then(|s| {
+        if let Some(hex) = s.strip_prefix("0x") {
+            u128::from_str_radix(hex, 16).ok()
+        } else {
+            s.parse().ok()
+        }
+    });
+
+    if opcode != Some(77) {
+        return false;
+    }
+
+    // All remaining inputs must be 0
+    inputs[1..].iter().all(|v| {
+        v.as_str()
+            .and_then(|s| {
+                if let Some(hex) = s.strip_prefix("0x") {
+                    u128::from_str_radix(hex, 16).ok()
+                } else {
+                    s.parse().ok()
+                }
+            })
+            .map_or(false, |n| n == 0)
+    })
+}
+
+/// Check if a transaction (by its traces) is a diesel mint.
+/// Returns true if there's exactly 1 trace and it's a diesel mint.
+fn is_diesel_mint_tx_json(traces: &[Value]) -> bool {
+    traces.len() == 1 && is_diesel_mint_trace_json(&traces[0])
+}
 const OUTPOINT_V2_PREFIX: &[u8] = b"/outpoint/v2/";
 const ALKANE_V2_PREFIX: &[u8] = b"/alkane/v2/";
 const TX_V2_PREFIX: &[u8] = b"/tx/v2/";
@@ -60,6 +233,237 @@ const ADDRESS_INDEX_V2_PREFIX: &[u8] = b"/address_index/v2/";
 const ADDRESS_INDEX_INLINE_CAP: usize = 8;
 const BALANCE_CHANGES_V2_PREFIX: &[u8] = b"/balance_changes/v2/";
 const ALKANE_LATEST_TRACES_V2_PREFIX: &[u8] = b"/alkane_latest_traces/v2/";
+
+/// Transaction type classification for alkane transactions.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, BorshSerialize, BorshDeserialize)]
+#[repr(u8)]
+pub enum TxType {
+    /// Diesel mint: contract 2:0, opcode 77
+    DieselMint = 0,
+    /// Mint on other contracts (opcode 77)
+    Mint = 1,
+    /// Simple transfer (balance changes, no complex invoke)
+    Transfer = 2,
+    /// Marketplace transaction (transfer with known marketplace fee address)
+    Marketplace = 3,
+    /// AMM swap interaction
+    Swap = 4,
+    /// New contract deployment (create event)
+    Deploy = 5,
+    /// Other contract call (invoke that doesn't match above)
+    OtherContractCall = 6,
+    /// Unknown classification
+    Unknown = 255,
+}
+
+impl Default for TxType {
+    fn default() -> Self {
+        TxType::Unknown
+    }
+}
+
+impl TxType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TxType::DieselMint => "diesel_mint",
+            TxType::Mint => "mint",
+            TxType::Transfer => "transfer",
+            TxType::Marketplace => "marketplace",
+            TxType::Swap => "swap",
+            TxType::Deploy => "deploy",
+            TxType::OtherContractCall => "other_contract_call",
+            TxType::Unknown => "unknown",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "diesel_mint" => Some(TxType::DieselMint),
+            "mint" => Some(TxType::Mint),
+            "transfer" => Some(TxType::Transfer),
+            "marketplace" => Some(TxType::Marketplace),
+            "swap" => Some(TxType::Swap),
+            "deploy" => Some(TxType::Deploy),
+            "other_contract_call" => Some(TxType::OtherContractCall),
+            "unknown" => Some(TxType::Unknown),
+            _ => None,
+        }
+    }
+}
+
+/// Known marketplace with its fee addresses.
+#[derive(Clone, Debug)]
+pub struct KnownMarketplace {
+    pub id: &'static str,
+    pub name: &'static str,
+    pub fee_addresses: &'static [&'static str],
+}
+
+/// Registry of known marketplaces and their fee addresses.
+pub static KNOWN_MARKETPLACES: &[KnownMarketplace] = &[
+    KnownMarketplace {
+        id: "idclub",
+        name: "IDclub",
+        fee_addresses: &[
+            "bc1qtr2m8tr797v2z6tptuqlveh0egper6m6m0vtls",
+            "bc1qvdyqz4uyjf40vq9h5jr5uyv9vrs8gcxne6u7pf",
+            "bc1qj33vexl9gujueg40efh7s27df32thnxnw9pdc2",
+        ],
+    },
+    KnownMarketplace {
+        id: "fairmints",
+        name: "Fairmints",
+        fee_addresses: &[
+            "bc1qnnja0erwudzd04m5j8n3jyk7zh7c4jl395vve2",
+            "bc1q05adsgqpnyxwcvrdurwmtc6swfne9llhy0t8nk",
+        ],
+    },
+];
+
+/// Look up a marketplace by fee address.
+/// Returns (marketplace_id, marketplace_name) if found.
+pub fn lookup_marketplace_by_fee_address(address: &str) -> Option<(&'static str, &'static str)> {
+    for mp in KNOWN_MARKETPLACES {
+        if mp.fee_addresses.contains(&address) {
+            return Some((mp.id, mp.name));
+        }
+    }
+    None
+}
+
+/// Result of transaction classification
+#[derive(Clone, Debug, Default)]
+pub struct TxClassification {
+    pub tx_type: TxType,
+    pub marketplace_info: Option<TxMarketplaceInfo>,
+}
+
+/// Classify a transaction based on its traces and output addresses.
+/// `output_addresses` is a list of (address, sats_value) for each output.
+pub fn classify_transaction(
+    traces: &[EspoSandshrewLikeTrace],
+    output_addresses: &[(String, u64)],
+) -> TxClassification {
+    // Check for diesel mint first
+    if is_diesel_mint_tx_sandshrew(traces) {
+        return TxClassification {
+            tx_type: TxType::DieselMint,
+            marketplace_info: None,
+        };
+    }
+
+    // Analyze trace events
+    let mut has_create = false;
+    let mut has_invoke = false;
+    let mut invoke_opcode: Option<u128> = None;
+    let mut invoke_contract: Option<(u32, u64)> = None;
+
+    for trace in traces {
+        for ev in &trace.events {
+            match ev {
+                EspoSandshrewLikeTraceEvent::Create(_) => {
+                    has_create = true;
+                }
+                EspoSandshrewLikeTraceEvent::Invoke(data) => {
+                    has_invoke = true;
+                    // Get the opcode (first input)
+                    if let Some(first_input) = data.context.inputs.first() {
+                        invoke_opcode = parse_u128_from_str(first_input);
+                    }
+                    // Get the contract ID
+                    if let Some(block) = parse_u32_or_hex(&data.context.myself.block) {
+                        if let Some(tx) = parse_u64_or_hex(&data.context.myself.tx) {
+                            invoke_contract = Some((block, tx));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Check for deploy (create event)
+    if has_create {
+        return TxClassification {
+            tx_type: TxType::Deploy,
+            marketplace_info: None,
+        };
+    }
+
+    // Check for mint (opcode 77 on non-diesel contracts)
+    if has_invoke && invoke_opcode == Some(77) {
+        // Already ruled out diesel mint above, so this is a regular mint
+        return TxClassification {
+            tx_type: TxType::Mint,
+            marketplace_info: None,
+        };
+    }
+
+    // Check for marketplace transaction (known fee address in outputs)
+    for (address, sats) in output_addresses {
+        if let Some((mp_id, mp_name)) = lookup_marketplace_by_fee_address(address) {
+            return TxClassification {
+                tx_type: TxType::Marketplace,
+                marketplace_info: Some(TxMarketplaceInfo {
+                    marketplace_id: mp_id.to_string(),
+                    marketplace_name: mp_name.to_string(),
+                    fee_address: address.clone(),
+                    fee_sats: Some(*sats),
+                }),
+            };
+        }
+    }
+
+    // Check for potential unknown marketplace:
+    // If there are balance changes (transfer) and small outputs that could be fees
+    let has_balance_changes = !traces.is_empty();
+    if has_balance_changes && !has_invoke {
+        // Look for small outputs (< 10000 sats) that could be marketplace fees
+        for (address, sats) in output_addresses {
+            if *sats > 0 && *sats < 50000 && !address.is_empty() {
+                // Potential unknown marketplace fee - but only flag if it looks like a fee pattern
+                // For now, we'll classify these as Transfer and not auto-detect unknown marketplaces
+                // The user can later add addresses to the known list
+            }
+        }
+    }
+
+    // Check for other contract call
+    if has_invoke {
+        // TODO: Could add swap detection here for AMM pools
+        return TxClassification {
+            tx_type: TxType::OtherContractCall,
+            marketplace_info: None,
+        };
+    }
+
+    // Default to transfer if we have traces but no invoke
+    if has_balance_changes {
+        return TxClassification {
+            tx_type: TxType::Transfer,
+            marketplace_info: None,
+        };
+    }
+
+    // Unknown
+    TxClassification {
+        tx_type: TxType::Unknown,
+        marketplace_info: None,
+    }
+}
+
+/// Marketplace info attached to a transaction.
+#[derive(Clone, Debug, Default, BorshSerialize, BorshDeserialize)]
+pub struct TxMarketplaceInfo {
+    /// Marketplace ID (e.g., "idclub", "fairmints", or "unknown")
+    pub marketplace_id: String,
+    /// Marketplace name (e.g., "IDclub", "Fairmints", or "Unknown")
+    pub marketplace_name: String,
+    /// Fee address detected in the transaction
+    pub fee_address: String,
+    /// Fee amount in sats (if detectable)
+    pub fee_sats: Option<u64>,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AddressIndexListKind {
@@ -290,6 +694,7 @@ pub struct EssentialsTable<'a> {
     pub ALKANE_NAME_INDEX: ListPointer<'a>,
     pub ALKANE_SYMBOL_INDEX: ListPointer<'a>,
     pub ORBITAL_COLLECTION_NAME: KvPointer<'a>,
+    pub ORBITAL_COLLECTION_START_INDEX: KvPointer<'a>,
     pub ALKANE_CREATION_BY_ID: KvPointer<'a>,
     pub ALKANE_CREATION_SEQ: KvPointer<'a>,
     pub ALKANE_CREATION_COUNT: KvPointer<'a>,
@@ -333,6 +738,7 @@ impl<'a> EssentialsTable<'a> {
             ALKANE_NAME_INDEX: root.list_keyword("/alkanes/name/"),
             ALKANE_SYMBOL_INDEX: root.list_keyword("/alkanes/symbol/"),
             ORBITAL_COLLECTION_NAME: root.keyword("/orbitals/collection/name/"),
+            ORBITAL_COLLECTION_START_INDEX: root.keyword("/orbitals/collection/start_index/"),
             ALKANE_CREATION_BY_ID: root.keyword("/alkanes/creation/id/"),
             ALKANE_CREATION_SEQ: root.keyword("/alkanes/creation/seq/v1/"),
             ALKANE_CREATION_COUNT: root.keyword("/alkanes/creation/count"),
@@ -1383,6 +1789,13 @@ impl<'a> EssentialsTable<'a> {
         suffix.extend_from_slice(&factory.block.to_be_bytes());
         suffix.extend_from_slice(&factory.tx.to_be_bytes());
         self.ORBITAL_COLLECTION_NAME.select(&suffix).key().to_vec()
+    }
+
+    pub fn orbital_collection_start_index_key(&self, factory: &SchemaAlkaneId) -> Vec<u8> {
+        let mut suffix = Vec::with_capacity(12);
+        suffix.extend_from_slice(&factory.block.to_be_bytes());
+        suffix.extend_from_slice(&factory.tx.to_be_bytes());
+        self.ORBITAL_COLLECTION_START_INDEX.select(&suffix).key().to_vec()
     }
 
     pub fn alkane_holders_ordered_key(&self, count: u64, alkane: &SchemaAlkaneId) -> Vec<u8> {
@@ -3884,6 +4297,8 @@ impl EssentialsProvider {
             });
         };
 
+        let hide_diesel = params.hide_diesel_mints.unwrap_or(false);
+
         let partials = match get_metashrew().traces_for_block_as_prost(height) {
             Ok(v) => v,
             Err(_) => {
@@ -3893,7 +4308,10 @@ impl EssentialsProvider {
             }
         };
 
-        let mut traces: Vec<Value> = Vec::with_capacity(partials.len());
+        // Group traces by txid to check for diesel mints at tx level
+        let mut traces_by_txid: HashMap<String, Vec<Value>> = HashMap::new();
+        let mut trace_order: Vec<String> = Vec::new();
+
         for p in partials {
             if p.outpoint.len() < 36 {
                 continue;
@@ -3910,10 +4328,29 @@ impl EssentialsProvider {
             };
             let events: Value = serde_json::from_str(&events_str).unwrap_or(Value::Null);
 
-            traces.push(json!({
+            if !traces_by_txid.contains_key(&txid_hex) {
+                trace_order.push(txid_hex.clone());
+            }
+            traces_by_txid.entry(txid_hex.clone()).or_default().push(json!({
                 "outpoint": format!("{txid_hex}:{vout}"),
                 "events": events
             }));
+        }
+
+        let mut traces: Vec<Value> = Vec::new();
+        for txid in trace_order {
+            let tx_traces = traces_by_txid.remove(&txid).unwrap_or_default();
+            // Check if this is a diesel mint tx (single trace with diesel mint pattern)
+            if hide_diesel {
+                let events_only: Vec<Value> = tx_traces
+                    .iter()
+                    .filter_map(|t| t.get("events").cloned())
+                    .collect();
+                if is_diesel_mint_tx_json(&events_only) {
+                    continue;
+                }
+            }
+            traces.extend(tx_traces);
         }
 
         Ok(RpcGetBlockTracesResult {
@@ -4354,11 +4791,23 @@ impl EssentialsProvider {
             }));
         }
 
+        // Build marketplace info JSON if present
+        let marketplace_json = summary.marketplace_info.as_ref().map(|info| {
+            json!({
+                "marketplace_id": info.marketplace_id,
+                "marketplace_name": info.marketplace_name,
+                "fee_address": info.fee_address,
+                "fee_sats": info.fee_sats,
+            })
+        });
+
         Ok(RpcGetAlkaneTxSummaryResult {
             value: json!({
                 "ok": true,
                 "txid": txid.to_string(),
                 "height": summary.height,
+                "tx_type": summary.tx_type.as_str(),
+                "marketplace_info": marketplace_json,
                 "traces": traces_json,
                 "outflows": outflows_json,
             }),
@@ -4377,8 +4826,11 @@ impl EssentialsProvider {
         let page = params.page.unwrap_or(1).max(1) as usize;
         let limit = params.limit.unwrap_or(50).max(1) as usize;
         let off = limit.saturating_mul(page.saturating_sub(1));
+        let hide_diesel = params.hide_diesel_mints.unwrap_or(false);
+        let filter_tx_type = params.tx_type.as_deref().and_then(TxType::from_str);
+        let needs_filtering = hide_diesel || filter_tx_type.is_some();
         let list_id = address_index_list_id_alkane_block_txs(height);
-        let total = get_address_index_list_len(
+        let raw_total = get_address_index_list_len(
             self,
             StateAt::Latest,
             AddressIndexListKind::AlkaneBlockTxs,
@@ -4386,7 +4838,7 @@ impl EssentialsProvider {
         )
         .unwrap_or(0) as usize;
 
-        if total == 0 {
+        if raw_total == 0 {
             return Ok(RpcGetAlkaneBlockTxsResult {
                 value: json!({
                     "ok": true,
@@ -4399,27 +4851,81 @@ impl EssentialsProvider {
             });
         }
 
-        let end = (off + limit).min(total);
-        let mut txids: Vec<String> = Vec::new();
-        let ids = if end > off {
-            get_address_index_list_range(
-                self,
-                StateAt::Latest,
-                AddressIndexListKind::AlkaneBlockTxs,
-                &list_id,
-                off as u64,
-                end as u64,
-            )
-            .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        for id in ids {
+        if !needs_filtering {
+            // Fast path: no filtering needed
+            let end = (off + limit).min(raw_total);
+            let mut txids: Vec<String> = Vec::new();
+            let ids = if end > off {
+                get_address_index_list_range(
+                    self,
+                    StateAt::Latest,
+                    AddressIndexListKind::AlkaneBlockTxs,
+                    &list_id,
+                    off as u64,
+                    end as u64,
+                )
+                .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            for id in ids {
+                let Some(blob) = load_tx_pointer_blob_v3_by_id(self, id) else {
+                    continue;
+                };
+                txids.push(Txid::from_byte_array(blob.txid).to_string());
+            }
+            return Ok(RpcGetAlkaneBlockTxsResult {
+                value: json!({
+                    "ok": true,
+                    "height": height,
+                    "page": page,
+                    "limit": limit,
+                    "total": raw_total,
+                    "txids": txids
+                }),
+            });
+        }
+
+        // Slow path: filter by tx_type and/or hide diesel mints, then paginate
+        let all_ids = get_address_index_list_range(
+            self,
+            StateAt::Latest,
+            AddressIndexListKind::AlkaneBlockTxs,
+            &list_id,
+            0,
+            raw_total as u64,
+        )
+        .unwrap_or_default();
+
+        let mut filtered_txids: Vec<Txid> = Vec::new();
+        for id in all_ids {
             let Some(blob) = load_tx_pointer_blob_v3_by_id(self, id) else {
                 continue;
             };
-            txids.push(Txid::from_byte_array(blob.txid).to_string());
+            let txid = Txid::from_byte_array(blob.txid);
+
+            // Filter by tx_type if specified
+            if let Some(wanted_type) = filter_tx_type {
+                if blob.tx_type != wanted_type {
+                    continue;
+                }
+            }
+
+            // Hide diesel mints if requested
+            if hide_diesel && blob.tx_type == TxType::DieselMint {
+                continue;
+            }
+
+            filtered_txids.push(txid);
         }
+
+        let filtered_total = filtered_txids.len();
+        let end = (off + limit).min(filtered_total);
+        let page_txids: Vec<String> = if end > off {
+            filtered_txids[off..end].iter().map(|t| t.to_string()).collect()
+        } else {
+            Vec::new()
+        };
 
         Ok(RpcGetAlkaneBlockTxsResult {
             value: json!({
@@ -4427,8 +4933,8 @@ impl EssentialsProvider {
                 "height": height,
                 "page": page,
                 "limit": limit,
-                "total": total,
-                "txids": txids
+                "total": filtered_total,
+                "txids": page_txids
             }),
         })
     }
@@ -4888,6 +5394,51 @@ impl EssentialsProvider {
     pub fn rpc_ping(&self, _params: RpcPingParams) -> Result<RpcPingResult> {
         Ok(RpcPingResult { value: Value::String("pong".to_string()) })
     }
+
+    /// Get the list of known marketplaces and their fee addresses.
+    pub fn rpc_get_known_marketplaces(
+        &self,
+        _params: RpcGetKnownMarketplacesParams,
+    ) -> Result<RpcGetKnownMarketplacesResult> {
+        let marketplaces: Vec<Value> = KNOWN_MARKETPLACES
+            .iter()
+            .map(|mp| {
+                json!({
+                    "id": mp.id,
+                    "name": mp.name,
+                    "fee_addresses": mp.fee_addresses,
+                })
+            })
+            .collect();
+
+        Ok(RpcGetKnownMarketplacesResult {
+            value: json!({
+                "ok": true,
+                "marketplaces": marketplaces,
+            }),
+        })
+    }
+
+    /// Get the list of available transaction types for filtering.
+    pub fn rpc_get_tx_types(&self, _params: RpcGetTxTypesParams) -> Result<RpcGetTxTypesResult> {
+        let tx_types = vec![
+            json!({ "id": "diesel_mint", "description": "Diesel mint (contract 2:0, opcode 77)" }),
+            json!({ "id": "mint", "description": "Mint on other contracts (opcode 77)" }),
+            json!({ "id": "transfer", "description": "Simple transfer (balance changes)" }),
+            json!({ "id": "marketplace", "description": "Marketplace transaction (known fee address)" }),
+            json!({ "id": "swap", "description": "AMM swap interaction" }),
+            json!({ "id": "deploy", "description": "New contract deployment" }),
+            json!({ "id": "other_contract_call", "description": "Other contract invocation" }),
+            json!({ "id": "unknown", "description": "Unknown classification" }),
+        ];
+
+        Ok(RpcGetTxTypesResult {
+            value: json!({
+                "ok": true,
+                "tx_types": tx_types,
+            }),
+        })
+    }
 }
 
 pub struct GetRawValueParams {
@@ -5346,6 +5897,7 @@ pub struct RpcGetOutpointBalancesResult {
 
 pub struct RpcGetBlockTracesParams {
     pub height: Option<u64>,
+    pub hide_diesel_mints: Option<bool>,
 }
 
 pub struct RpcGetBlockTracesResult {
@@ -5389,6 +5941,9 @@ pub struct RpcGetAlkaneBlockTxsParams {
     pub height: Option<u64>,
     pub page: Option<u64>,
     pub limit: Option<u64>,
+    pub hide_diesel_mints: Option<bool>,
+    /// Filter by transaction type (e.g., "diesel_mint", "mint", "transfer", "marketplace", etc.)
+    pub tx_type: Option<String>,
 }
 
 pub struct RpcGetAlkaneBlockTxsResult {
@@ -5425,6 +5980,18 @@ pub struct RpcGetAlkaneLatestTracesResult {
 pub struct RpcPingParams;
 
 pub struct RpcPingResult {
+    pub value: Value,
+}
+
+pub struct RpcGetKnownMarketplacesParams;
+
+pub struct RpcGetKnownMarketplacesResult {
+    pub value: Value,
+}
+
+pub struct RpcGetTxTypesParams;
+
+pub struct RpcGetTxTypesResult {
     pub value: Value,
 }
 
@@ -5494,6 +6061,10 @@ pub struct AlkaneTxSummary {
     pub traces: Vec<EspoSandshrewLikeTrace>,
     pub outflows: Vec<AlkaneBalanceTxEntry>,
     pub height: u32,
+    /// Transaction type classification
+    pub tx_type: TxType,
+    /// Marketplace info (if tx_type is Marketplace)
+    pub marketplace_info: Option<TxMarketplaceInfo>,
 }
 
 #[derive(Clone, Debug, Default, BorshSerialize, BorshDeserialize)]
@@ -5501,6 +6072,10 @@ pub struct TxPackedOutflowRowV2 {
     pub height: u32,
     pub traces: Vec<EspoSandshrewLikeTrace>,
     pub outflows: BTreeMap<SchemaAlkaneId, BTreeMap<SchemaAlkaneId, SignedU128>>,
+    /// Transaction type classification
+    pub tx_type: TxType,
+    /// Marketplace info (if tx_type is Marketplace)
+    pub marketplace_info: Option<TxMarketplaceInfo>,
 }
 
 #[derive(Clone, Debug, Default, BorshSerialize, BorshDeserialize)]
@@ -5511,6 +6086,10 @@ pub struct TxPointerBlobV3 {
     pub height: u32,
     pub traces: Vec<EspoSandshrewLikeTrace>,
     pub outflows: BTreeMap<SchemaAlkaneId, BTreeMap<SchemaAlkaneId, SignedU128>>,
+    /// Transaction type classification
+    pub tx_type: TxType,
+    /// Marketplace info (if tx_type is Marketplace)
+    pub marketplace_info: Option<TxMarketplaceInfo>,
 }
 
 #[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
@@ -5781,11 +6360,15 @@ pub fn encode_tx_packed_outflow_row_v2(
     height: u32,
     traces: &[EspoSandshrewLikeTrace],
     outflows: &BTreeMap<SchemaAlkaneId, BTreeMap<SchemaAlkaneId, SignedU128>>,
+    tx_type: TxType,
+    marketplace_info: Option<TxMarketplaceInfo>,
 ) -> Result<Vec<u8>> {
     borsh::to_vec(&TxPackedOutflowRowV2 {
         height,
         traces: traces.to_vec(),
         outflows: outflows.clone(),
+        tx_type,
+        marketplace_info,
     })
     .map_err(|e| anyhow!("encode tx packed outflow v2 failed: {e}"))
 }
@@ -6536,6 +7119,8 @@ pub fn encode_tx_pointer_blob_v3(
     height: u32,
     traces: &[EspoSandshrewLikeTrace],
     outflows: &BTreeMap<SchemaAlkaneId, BTreeMap<SchemaAlkaneId, SignedU128>>,
+    tx_type: TxType,
+    marketplace_info: Option<TxMarketplaceInfo>,
 ) -> Result<Vec<u8>> {
     borsh::to_vec(&TxPointerBlobV3 {
         txid: *txid,
@@ -6544,6 +7129,8 @@ pub fn encode_tx_pointer_blob_v3(
         height,
         traces: traces.to_vec(),
         outflows: outflows.clone(),
+        tx_type,
+        marketplace_info,
     })
     .map_err(|e| anyhow!("encode tx pointer blob v3 failed: {e}"))
 }
@@ -6798,6 +7385,8 @@ pub(crate) fn load_tx_packed_outflow_v2(
             height: blob.height,
             traces: blob.traces,
             outflows: blob.outflows,
+            tx_type: blob.tx_type,
+            marketplace_info: blob.marketplace_info,
         });
     }
     None
@@ -6842,7 +7431,14 @@ pub(crate) fn load_tx_summary_v2(
             outflow: outflow_map,
         });
     }
-    Some(AlkaneTxSummary { txid: txid_arr, traces: packed.traces, outflows, height: packed.height })
+    Some(AlkaneTxSummary {
+        txid: txid_arr,
+        traces: packed.traces,
+        outflows,
+        height: packed.height,
+        tx_type: packed.tx_type,
+        marketplace_info: packed.marketplace_info,
+    })
 }
 
 fn mem_entry_to_json(entry: &MempoolEntry) -> Value {

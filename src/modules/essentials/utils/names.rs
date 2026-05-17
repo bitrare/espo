@@ -228,3 +228,55 @@ where
         }
     }
 }
+
+/// Parse the numeric index from an orbital NFT name like "sTREASURE #4327" -> 4327
+pub fn parse_orbital_index_from_name(name: &str) -> Option<u128> {
+    // Look for pattern "# followed by digits" at the end
+    let trimmed = name.trim();
+    if let Some(hash_pos) = trimmed.rfind('#') {
+        let after_hash = trimmed[hash_pos + 1..].trim();
+        return after_hash.parse::<u128>().ok();
+    }
+    None
+}
+
+/// Detect the starting index offset for an orbital collection.
+/// Returns the offset to add to the stored /index value to get the correct name index.
+/// - If the collection starts at #1 (most common), returns 1
+/// - If the collection starts at #0, returns 0
+///
+/// `stored_index` is the value from the /index storage key (0-based counter of mints)
+/// `height` is the block height for the simulate call
+pub fn detect_orbital_start_offset(
+    alkane: &SchemaAlkaneId,
+    stored_index: u128,
+    height: u32,
+) -> u128 {
+    // Call simulate to get the actual name from the contract
+    match simulate_get_name(alkane, height) {
+        Ok(Some(actual_name)) => {
+            if let Some(actual_index) = parse_orbital_index_from_name(&actual_name) {
+                // offset = actual_index - stored_index
+                // If stored_index=4327 and actual_name shows #4327, offset = 0 (starts at #0)
+                // If stored_index=4327 and actual_name shows #4328, offset = 1 (starts at #1)
+                if actual_index >= stored_index {
+                    return actual_index - stored_index;
+                }
+            }
+        }
+        Ok(None) => {
+            eprintln!(
+                "[ESSENTIALS] detect_orbital_start_offset: simulate returned no name for {}:{}",
+                alkane.block, alkane.tx
+            );
+        }
+        Err(e) => {
+            eprintln!(
+                "[ESSENTIALS] detect_orbital_start_offset: simulate failed for {}:{}: {e}",
+                alkane.block, alkane.tx
+            );
+        }
+    }
+    // Default to 1 (most common case: collections start at #1)
+    1
+}

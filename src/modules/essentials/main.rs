@@ -17,7 +17,7 @@ use crate::modules::essentials::utils::inspections::{
     inspect_wasm_metadata,
 };
 use crate::modules::essentials::utils::names::{
-    get_name as get_alkane_name, normalize_alkane_name,
+    detect_orbital_start_offset, get_name as get_alkane_name, normalize_alkane_name,
 };
 use crate::modules::runes::main::{runes_enabled_from_global_config, runes_genesis_block};
 use crate::runtime::mdb::Mdb;
@@ -212,6 +212,9 @@ impl EspoModule for Essentials {
         let mut orbital_index_updates: HashMap<SchemaAlkaneId, u128> = HashMap::new();
         let mut orbital_collection_name_rows: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
         let mut orbital_collection_name_cache: HashMap<SchemaAlkaneId, Option<String>> =
+            HashMap::new();
+        let mut orbital_collection_start_index_rows: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+        let mut orbital_collection_start_index_cache: HashMap<SchemaAlkaneId, Option<u128>> =
             HashMap::new();
         let mut name_index_rows: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
         let mut symbol_index_rows: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
@@ -523,7 +526,50 @@ impl EspoModule for Essentials {
                                 .insert(factory_id, Some(base.to_string()));
                         }
                         if let Some(idx) = orbital_index_updates.get(&rec.alkane).copied() {
-                            let constructed = format!("{base} #{}", idx.saturating_add(1));
+                            // Get or detect the start index offset for this collection
+                            let start_offset = if let Some(cached) =
+                                orbital_collection_start_index_cache.get(&factory_id)
+                            {
+                                cached.unwrap_or(1)
+                            } else {
+                                // Try to load from storage
+                                let key = table.orbital_collection_start_index_key(&factory_id);
+                                let stored = provider
+                                    .get_raw_value(GetRawValueParams {
+                                        blockhash: StateAt::Block(block_hash),
+                                        key: key.clone(),
+                                    })
+                                    .ok()
+                                    .and_then(|resp| resp.value)
+                                    .and_then(|bytes| {
+                                        if bytes.len() >= 16 {
+                                            Some(u128::from_le_bytes(
+                                                bytes[..16].try_into().unwrap(),
+                                            ))
+                                        } else {
+                                            None
+                                        }
+                                    });
+                                if let Some(offset) = stored {
+                                    orbital_collection_start_index_cache
+                                        .insert(factory_id, Some(offset));
+                                    offset
+                                } else {
+                                    // Detect the start offset by calling simulate
+                                    let detected =
+                                        detect_orbital_start_offset(&rec.alkane, idx, block.height);
+                                    // Store it for future use
+                                    let mut offset_bytes = [0u8; 16];
+                                    offset_bytes.copy_from_slice(&detected.to_le_bytes());
+                                    orbital_collection_start_index_rows
+                                        .insert(key, offset_bytes.to_vec());
+                                    orbital_collection_start_index_cache
+                                        .insert(factory_id, Some(detected));
+                                    detected
+                                }
+                            };
+                            let constructed =
+                                format!("{base} #{}", idx.saturating_add(start_offset));
                             ensure_primary_name(&mut rec.names, &constructed);
                             applied_orbital_name = true;
                         } else if let Some(name) = name_from_simulate.as_ref() {
@@ -770,6 +816,9 @@ impl EspoModule for Essentials {
         let mut orbital_collection_name_keys: Vec<Vec<u8>> =
             orbital_collection_name_rows.keys().cloned().collect();
         orbital_collection_name_keys.sort_unstable();
+        let mut orbital_collection_start_index_keys: Vec<Vec<u8>> =
+            orbital_collection_start_index_rows.keys().cloned().collect();
+        orbital_collection_start_index_keys.sort_unstable();
         let mut holders_index_keys: Vec<Vec<u8>> = holders_index_rows.into_iter().collect();
         holders_index_keys.sort_unstable();
         let mut creation_count_row: Option<[u8; 8]> = None;
@@ -808,6 +857,11 @@ impl EspoModule for Essentials {
         }
         for k in &orbital_collection_name_keys {
             if let Some(v) = orbital_collection_name_rows.get(k) {
+                puts.push((k.clone(), v.clone()));
+            }
+        }
+        for k in &orbital_collection_start_index_keys {
+            if let Some(v) = orbital_collection_start_index_rows.get(k) {
                 puts.push((k.clone(), v.clone()));
             }
         }

@@ -235,7 +235,8 @@ const BALANCE_CHANGES_V2_PREFIX: &[u8] = b"/balance_changes/v2/";
 const ALKANE_LATEST_TRACES_V2_PREFIX: &[u8] = b"/alkane_latest_traces/v2/";
 
 /// Transaction type classification for alkane transactions.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, BorshSerialize, BorshDeserialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, BorshSerialize, BorshDeserialize)]
+#[borsh(use_discriminant = true)]
 #[repr(u8)]
 pub enum TxType {
     /// Diesel mint: contract 2:0, opcode 77
@@ -253,13 +254,8 @@ pub enum TxType {
     /// Other contract call (invoke that doesn't match above)
     OtherContractCall = 6,
     /// Unknown classification
+    #[default]
     Unknown = 255,
-}
-
-impl Default for TxType {
-    fn default() -> Self {
-        TxType::Unknown
-    }
 }
 
 impl TxType {
@@ -356,7 +352,7 @@ pub fn classify_transaction(
     let mut has_create = false;
     let mut has_invoke = false;
     let mut invoke_opcode: Option<u128> = None;
-    let mut invoke_contract: Option<(u32, u64)> = None;
+    let mut _invoke_contract: Option<(u32, u64)> = None;
 
     for trace in traces {
         for ev in &trace.events {
@@ -373,7 +369,7 @@ pub fn classify_transaction(
                     // Get the contract ID
                     if let Some(block) = parse_u32_or_hex(&data.context.myself.block) {
                         if let Some(tx) = parse_u64_or_hex(&data.context.myself.tx) {
-                            invoke_contract = Some((block, tx));
+                            _invoke_contract = Some((block, tx));
                         }
                     }
                 }

@@ -602,7 +602,7 @@ pub async fn address_page(
                     .as_ref()
                     .map(|s| traces_from_summary(txid, s))
                     .filter(|t| !t.is_empty());
-                let tx_type = summary.as_ref().and_then(|s| s.tx_type.clone());
+                let tx_type = summary.as_ref().map(|s| s.tx_type);
                 tx_renders.push(AddressTxRender {
                     txid: *txid,
                     tx,
@@ -705,7 +705,7 @@ pub async fn address_page(
                 if traces.is_some() {
                     traces_hits = traces_hits.saturating_add(1);
                 }
-                let tx_type = summary.as_ref().and_then(|s| s.tx_type.clone());
+                let tx_type = summary.as_ref().map(|s| s.tx_type);
 
                 tx_renders.push(AddressTxRender {
                     txid: *txid,
@@ -799,7 +799,7 @@ pub async fn address_page(
                     .as_ref()
                     .map(|s| traces_from_summary(txid, s))
                     .filter(|t| !t.is_empty());
-                let tx_type = summary.as_ref().and_then(|s| s.tx_type.clone());
+                let tx_type = summary.as_ref().map(|s| s.tx_type);
                 tx_renders.push(AddressTxRender {
                     txid: *txid,
                     tx,
@@ -900,7 +900,7 @@ pub async fn address_page(
                                 chain_tip
                                     .and_then(|tip| if tip >= h { Some(tip - h + 1) } else { None })
                             });
-                            let tx_type = summary.as_ref().and_then(|s| s.tx_type.clone());
+                            let tx_type = summary.as_ref().map(|s| s.tx_type);
                             tx_renders.push(AddressTxRender {
                                 txid: entry.txid,
                                 tx,

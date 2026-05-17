@@ -494,7 +494,7 @@ pub async fn block_page(
                     .as_ref()
                     .map(|s| traces_from_summary(txid, s))
                     .filter(|t| !t.is_empty());
-                let tx_type = summary.as_ref().and_then(|s| s.tx_type.clone());
+                let tx_type = summary.as_ref().map(|s| s.tx_type);
                 tx_items.push(BlockTxItem { txid: *txid, tx, traces, tx_type });
             }
             if tx_total > 0 && off < tx_total {
@@ -574,7 +574,7 @@ pub async fn block_page(
                             .as_ref()
                             .map(|s| traces_from_summary(txid, s))
                             .filter(|t| !t.is_empty());
-                        let tx_type = summary.as_ref().and_then(|s| s.tx_type.clone());
+                        let tx_type = summary.as_ref().map(|s| s.tx_type);
                         tx_items.push(BlockTxItem { txid: *txid, tx, traces, tx_type });
                     }
                     if tx_total > 0 && off < tx_total {
@@ -627,7 +627,7 @@ pub async fn block_page(
                             .as_ref()
                             .map(|s| traces_from_summary(txid, s))
                             .filter(|t| !t.is_empty());
-                        let tx_type = summary.as_ref().and_then(|s| s.tx_type.clone());
+                        let tx_type = summary.as_ref().map(|s| s.tx_type);
                         tx_items.push(BlockTxItem { txid: *txid, tx, traces, tx_type });
                     }
                     if tx_total > 0 && off < tx_total {
@@ -687,7 +687,7 @@ pub async fn block_page(
                     .as_ref()
                     .map(|s| traces_from_summary(txid, s))
                     .filter(|t| !t.is_empty());
-                let tx_type = summary.as_ref().and_then(|s| s.tx_type.clone());
+                let tx_type = summary.as_ref().map(|s| s.tx_type);
                 tx_items.push(BlockTxItem { txid: *txid, tx, traces, tx_type });
             }
             if tx_total > 0 && off < tx_total {
@@ -705,7 +705,7 @@ pub async fn block_page(
                 .map(|atx| {
                     let txid = atx.transaction.compute_txid();
                     let summary = load_tx_summary_v2(&essentials_provider, &txid);
-                    let tx_type = summary.as_ref().and_then(|s| s.tx_type.clone());
+                    let tx_type = summary.as_ref().map(|s| s.tx_type);
                     BlockTxItem {
                         txid,
                         tx: atx.transaction,

@@ -17,7 +17,7 @@ use crate::modules::ammdata::storage::{AmmDataTable, SearchIndexField};
 use crate::modules::ammdata::utils::search::collect_search_prefixes;
 use crate::modules::essentials::storage::{
     AddressActivityEntry, AddressAmountEntry, AddressIndexListKind, AlkaneBalanceTxEntry,
-    AlkaneTxSummary, BalanceEntry, HolderEntry, HolderId, TxType, TxMarketplaceInfo,
+    AlkaneTxSummary, BalanceEntry, HolderEntry, HolderId,
     address_index_list_id_alkane_balance_txs_by_token, address_index_list_id_alkane_block_txs,
     append_address_index_values, build_outpoint_pos_versioned_puts,
     build_outpoint_spent_versioned_puts, build_tx_pos_versioned_puts, classify_transaction,

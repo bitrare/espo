@@ -29,7 +29,7 @@ use crate::explorer::pages::block::mempool_block_projected_balances;
 use crate::explorer::pages::common::format_fee_rate;
 use crate::explorer::pages::state::ExplorerState;
 use crate::explorer::paths::explorer_path;
-use crate::modules::essentials::storage::{BalanceEntry, TxType, load_tx_summary_v2, EssentialsProvider};
+use crate::modules::essentials::storage::{BalanceEntry, load_tx_summary_v2};
 use crate::modules::essentials::utils::balances::{
     OutpointLookup, get_outpoint_balances_with_spent, get_outpoint_balances_with_spent_batch,
 };
@@ -643,7 +643,7 @@ pub async fn tx_page(State(state): State<ExplorerState>, Path(txid_str): Path<St
     
     let tx_type_pill = if tx_height.is_some() {
         let summary = load_tx_summary_v2(&state.essentials_provider(), &txid);
-        summary.as_ref().and_then(|s| s.tx_type.as_ref()).map(TxTypePill::from_tx_type)
+        summary.as_ref().map(|s| TxTypePill::from_tx_type(&s.tx_type))
     } else {
         None
     };

@@ -91,6 +91,16 @@ fn format_scaled_usd_price(bytes: [u8; 32]) -> String {
     format!("${whole}.{frac}")
 }
 
+fn format_btc_usd_price(price: u128) -> String {
+    let cents = price
+        .saturating_mul(100)
+        .saturating_add(PRICE_SCALE / 2)
+        .saturating_div(PRICE_SCALE);
+    let whole = cents / 100;
+    let frac = cents % 100;
+    format!("${}.{:02}", comma_decimal_digits(&whole.to_string()), frac)
+}
+
 fn price_summary_value(value: Option<[u8; 32]>) -> maud::Markup {
     match value {
         Some(bytes) => html! { span class="summary-value" { (format_scaled_usd_price(bytes)) } },
@@ -839,6 +849,12 @@ pub async fn block_page(
         .or_else(|| espo_block.as_ref().map(|b| b.tx_count as u64));
     let median_fee_rate: Option<f64> = block_summary.as_ref().map(|summary| summary.fee_median);
 
+    let btc_usd_price = state
+        .ammdata_provider()
+        .get_btc_usd_price_at_or_before_height(height as u32)
+        .ok()
+        .flatten();
+
     let mut summary_items: Vec<HeaderSummaryItem> = Vec::new();
     summary_items.push(HeaderSummaryItem {
         label: "Timestamp".to_string(),
@@ -850,6 +866,16 @@ pub async fn block_page(
                 }
             },
             None => html! { span class="summary-value muted" { "Pending" } },
+        },
+    });
+    summary_items.push(HeaderSummaryItem {
+        label: "BTC/USD".to_string(),
+        value: match btc_usd_price {
+            Some(price) => {
+                let formatted = format_btc_usd_price(price);
+                html! { span class="summary-value" { (formatted) } }
+            }
+            None => html! { span class="summary-value muted" { "—" } },
         },
     });
     summary_items.push(HeaderSummaryItem {

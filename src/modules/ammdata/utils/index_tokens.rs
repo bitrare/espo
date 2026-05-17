@@ -1,7 +1,7 @@
-use crate::modules::ammdata::config::{DerivedMergeStrategy, DerivedQuoteConfig};
+use crate::modules::ammdata::config::{AmmDataConfig, DerivedMergeStrategy, DerivedQuoteConfig};
 use crate::modules::ammdata::consts::{AMOUNT_SCALE, CanonicalQuoteUnit, PRICE_SCALE};
 use crate::modules::ammdata::price_feeds::{
-    EspoPricerPriceFeed, PriceFeed, get_historical_btc_usd_price,
+    CoinGeckoPriceFeed, EspoPricerPriceFeed, PriceFeed, get_historical_btc_usd_price,
 };
 use crate::modules::ammdata::schemas::{
     SchemaCandleV1, SchemaCanonicalPoolEntry, SchemaFullCandleV1, SchemaTokenMetricsV1, Timeframe,
@@ -238,28 +238,62 @@ pub fn derive_token_data(
     };
 
     // ---------- btc/usd price ----------
-    if state.has_trades {
+    // Load config to check if we should store price every block
+    let store_price_every_block = AmmDataConfig::load_from_global_config()
+        .map(|cfg| cfg.store_price_every_block)
+        .unwrap_or(true);
+    
+    // Store price if we have trades OR if store_price_every_block is enabled
+    if state.has_trades || store_price_every_block {
         let mut price: Option<u128> = None;
-        match EspoPricerPriceFeed::from_global_config() {
-            Ok(feed) => match feed.get_bitcoin_price_usd_at_block_height(height as u64) {
-                Ok(v) => price = Some(v),
-                Err(e) => {
-                    eprintln!("[AMMDATA] btc/usd espo pricer failed at height {height}: {e:?}");
+        
+        // 1. Try CoinGecko first (primary source)
+        if price.is_none() {
+            match CoinGeckoPriceFeed::from_global_config() {
+                Ok(Some(feed)) => match feed.get_bitcoin_price_usd_at_block_height(height as u64) {
+                    Ok(v) => {
+                        price = Some(v);
+                        eprintln!("[AMMDATA] btc/usd from CoinGecko at height {height}");
+                    }
+                    Err(e) => {
+                        eprintln!("[AMMDATA] btc/usd CoinGecko failed at height {height}: {e:?}");
+                    }
+                },
+                Ok(None) => {
+                    // CoinGecko not configured, skip
                 }
-            },
-            Err(e) => {
-                eprintln!("[AMMDATA] btc/usd espo pricer init failed at height {height}: {e:?}")
+                Err(e) => {
+                    eprintln!("[AMMDATA] btc/usd CoinGecko init failed at height {height}: {e:?}")
+                }
+            }
+        }
+        
+        // 2. Fallback to espo_pricer
+        if price.is_none() {
+            match EspoPricerPriceFeed::from_global_config() {
+                Ok(feed) => match feed.get_bitcoin_price_usd_at_block_height(height as u64) {
+                    Ok(v) => {
+                        price = Some(v);
+                        eprintln!("[AMMDATA] btc/usd from espo_pricer at height {height}");
+                    }
+                    Err(e) => {
+                        eprintln!("[AMMDATA] btc/usd espo pricer failed at height {height}: {e:?}");
+                    }
+                },
+                Err(e) => {
+                    eprintln!("[AMMDATA] btc/usd espo pricer init failed at height {height}: {e:?}")
+                }
             }
         }
 
+        // 3. Fallback to last indexed price from DB
         if price.is_none() {
             price = provider
                 .get_btc_usd_price_entry_at_or_before_height(height as u64)?
                 .map(|(_price_height, price)| price);
         }
 
-        // The JSON file is only a bootstrap backfill. Once the ammdata index has a price,
-        // carry forward that indexed value instead of replacing it with historical JSON.
+        // 4. Fallback to historical JSON backfill
         if price.is_none() {
             if use_historical_backfill {
                 match get_historical_btc_usd_price(height as u64) {

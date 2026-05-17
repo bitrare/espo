@@ -52,6 +52,33 @@ pub enum TxPillTone {
     Danger,
 }
 
+/// Transaction type pill for displaying classification
+#[derive(Clone, Debug)]
+pub struct TxTypePill {
+    pub label: String,
+    pub css_class: String,
+}
+
+impl TxTypePill {
+    pub fn from_tx_type(tx_type: &crate::modules::essentials::storage::TxType) -> Self {
+        use crate::modules::essentials::storage::TxType;
+        let (label, css_class) = match tx_type {
+            TxType::DieselMint => ("Diesel Mint", "tx-type-diesel-mint"),
+            TxType::Mint => ("Mint", "tx-type-mint"),
+            TxType::Transfer => ("Transfer", "tx-type-transfer"),
+            TxType::Marketplace => ("Marketplace", "tx-type-marketplace"),
+            TxType::Swap => ("Swap", "tx-type-swap"),
+            TxType::Deploy => ("Deploy", "tx-type-deploy"),
+            TxType::OtherContractCall => ("Contract Call", "tx-type-contract"),
+            TxType::Unknown => ("Unknown", "tx-type-unknown"),
+        };
+        Self {
+            label: label.to_string(),
+            css_class: css_class.to_string(),
+        }
+    }
+}
+
 fn tx_fee_rate(tx: &Transaction, prev_map: &HashMap<Txid, Transaction>) -> Option<f64> {
     let mut input_total = 0u64;
     for vin in &tx.input {
@@ -957,6 +984,7 @@ pub fn render_tx(
     projected_rune_io_override: Option<&TxRuneIo>,
     show_tx_title: bool,
     defer_alkane_trace_status: bool,
+    tx_type_pill: Option<TxTypePill>,
 ) -> Markup {
     let mut alkane_meta_cache: AlkaneMetaCache = HashMap::new();
     let mut alkane_impl_cache: AlkaneImplCache = HashMap::new();
@@ -1027,8 +1055,11 @@ pub fn render_tx(
                     (vouts_markup)
                 }
             }
-            @if pill.is_some() || fee_pill_label.is_some() {
+            @if pill.is_some() || fee_pill_label.is_some() || tx_type_pill.is_some() {
                 div class="tx-pill-row" {
+                    @if let Some(tx_type) = tx_type_pill.as_ref() {
+                        span class=(format!("pill tx-pill {}", tx_type.css_class)) { (tx_type.label.clone()) }
+                    }
                     @if let Some(fee_label) = fee_pill_label.as_ref() {
                         span class="pill tx-pill tx-pill-fee" { (fee_label) }
                     }

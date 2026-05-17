@@ -31,14 +31,14 @@ use crate::explorer::components::layout::layout_with_meta;
 use crate::explorer::components::svg_assets::{
     icon_arrow_up_right, icon_pager_first, icon_pager_last, icon_pager_left, icon_pager_right,
 };
-use crate::explorer::components::tx_view::{TxPill, TxPillTone, render_tx};
+use crate::explorer::components::tx_view::{TxPill, TxPillTone, TxTypePill, render_tx};
 use crate::explorer::consts::{DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT};
 use crate::explorer::pages::common::format_fee_rate;
 use crate::explorer::pages::state::ExplorerState;
 use crate::explorer::paths::explorer_path;
 use crate::modules::ammdata::consts::PRICE_SCALE;
 use crate::modules::essentials::storage::{
-    AddressIndexListKind, AlkaneTxSummary, BalanceEntry, address_index_list_id_alkane_block_txs,
+    AddressIndexListKind, AlkaneTxSummary, BalanceEntry, TxType, address_index_list_id_alkane_block_txs,
     get_address_index_list_len, get_address_index_list_range, load_tx_pointer_blob_v3_by_id,
     load_tx_summary_v2,
 };
@@ -165,6 +165,7 @@ struct BlockTxItem {
     txid: Txid,
     tx: Transaction,
     traces: Option<Vec<EspoTrace>>,
+    tx_type: Option<TxType>,
 }
 
 fn traces_from_summary(txid: &Txid, summary: &AlkaneTxSummary) -> Vec<EspoTrace> {
@@ -493,7 +494,8 @@ pub async fn block_page(
                     .as_ref()
                     .map(|s| traces_from_summary(txid, s))
                     .filter(|t| !t.is_empty());
-                tx_items.push(BlockTxItem { txid: *txid, tx, traces });
+                let tx_type = summary.as_ref().and_then(|s| s.tx_type.clone());
+                tx_items.push(BlockTxItem { txid: *txid, tx, traces, tx_type });
             }
             if tx_total > 0 && off < tx_total {
                 display_end = (off + tx_items.len()).min(tx_total);
@@ -572,7 +574,8 @@ pub async fn block_page(
                             .as_ref()
                             .map(|s| traces_from_summary(txid, s))
                             .filter(|t| !t.is_empty());
-                        tx_items.push(BlockTxItem { txid: *txid, tx, traces });
+                        let tx_type = summary.as_ref().and_then(|s| s.tx_type.clone());
+                        tx_items.push(BlockTxItem { txid: *txid, tx, traces, tx_type });
                     }
                     if tx_total > 0 && off < tx_total {
                         display_end = (off + tx_items.len()).min(tx_total);
@@ -624,7 +627,8 @@ pub async fn block_page(
                             .as_ref()
                             .map(|s| traces_from_summary(txid, s))
                             .filter(|t| !t.is_empty());
-                        tx_items.push(BlockTxItem { txid: *txid, tx, traces });
+                        let tx_type = summary.as_ref().and_then(|s| s.tx_type.clone());
+                        tx_items.push(BlockTxItem { txid: *txid, tx, traces, tx_type });
                     }
                     if tx_total > 0 && off < tx_total {
                         display_end = (off + tx_items.len()).min(tx_total);
@@ -683,7 +687,8 @@ pub async fn block_page(
                     .as_ref()
                     .map(|s| traces_from_summary(txid, s))
                     .filter(|t| !t.is_empty());
-                tx_items.push(BlockTxItem { txid: *txid, tx, traces });
+                let tx_type = summary.as_ref().and_then(|s| s.tx_type.clone());
+                tx_items.push(BlockTxItem { txid: *txid, tx, traces, tx_type });
             }
             if tx_total > 0 && off < tx_total {
                 display_end = (off + tx_items.len()).min(tx_total);
@@ -697,10 +702,16 @@ pub async fn block_page(
             tx_items = espo_block
                 .transactions
                 .into_iter()
-                .map(|atx| BlockTxItem {
-                    txid: atx.transaction.compute_txid(),
-                    tx: atx.transaction,
-                    traces: atx.traces,
+                .map(|atx| {
+                    let txid = atx.transaction.compute_txid();
+                    let summary = load_tx_summary_v2(&essentials_provider, &txid);
+                    let tx_type = summary.as_ref().and_then(|s| s.tx_type.clone());
+                    BlockTxItem {
+                        txid,
+                        tx: atx.transaction,
+                        traces: atx.traces,
+                        tx_type,
+                    }
                 })
                 .collect();
             if hide_diesel_mints {
@@ -1029,7 +1040,8 @@ pub async fn block_page(
                     div class="list" {
                         @for item in tx_items {
                             @let traces: Option<&[EspoTrace]> = item.traces.as_ref().map(|v| v.as_slice());
-                            (render_tx(&item.txid, &item.tx, traces, network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb, Some(base_pill.clone()), None, None, None, true, false))
+                            @let tx_type_pill = item.tx_type.as_ref().map(TxTypePill::from_tx_type);
+                            (render_tx(&item.txid, &item.tx, traces, network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb, Some(base_pill.clone()), None, None, None, true, false, tx_type_pill))
                         }
                     }
                 }
@@ -1400,7 +1412,7 @@ pub async fn mempool_block_page(
                             };
                             @let projected_balances = projected_balances_by_tx.get(&item.txid);
                             @let projected_rune_io = item.rune_io.as_ref();
-                            (render_tx(&item.txid, &item.tx, traces, network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb, Some(status_pill), Some(item.fee_rate), projected_balances, projected_rune_io, true, item.defer_alkane_trace_status))
+                            (render_tx(&item.txid, &item.tx, traces, network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb, Some(status_pill), Some(item.fee_rate), projected_balances, projected_rune_io, true, item.defer_alkane_trace_status, None))
                         }
                     }
                 }

@@ -23,7 +23,15 @@ pub struct DerivedLiquidityConfig {
 }
 
 #[derive(Clone, Debug)]
+pub struct CoinGeckoConfig {
+    pub api_url: String,
+    pub api_key: String,
+    pub timeout_secs: u64,
+}
+
+#[derive(Clone, Debug)]
 pub struct AmmDataConfig {
+    pub coingecko: Option<CoinGeckoConfig>,
     pub espo_pricer_host: String,
     pub use_historical_backfill: bool,
     pub pre_ammdata_btc_usd_price: u128,
@@ -33,17 +41,44 @@ pub struct AmmDataConfig {
     pub search_fallback_scan_cap: u64,
     pub search_limit_cap: u64,
     pub derived_liquidity: Option<DerivedLiquidityConfig>,
+    pub store_price_every_block: bool,
 }
 
 impl AmmDataConfig {
     pub fn spec() -> &'static str {
-        "{ \"espo_pricer_host\": \"http://127.0.0.1:6901\", \"use_historical_backfill\": <bool=true>, \"pre_ammdata_btc_usd_price\": <86500 or \"86500.12\">, \"search_index_enabled\": <bool>, \"search_prefix_min\": <2>, \"search_prefix_max\": <6>, \"search_fallback_scan_cap\": <num>, \"search_limit_cap\": <num>, \"derived_liquidity\": [ { \"alkane\": \"2:0\", \"strategy\": \"neutral|neutral-vwap|optimistic|pessimistic\" } ] }"
+        "{ \"coingecko\": { \"api_url\": \"https://pro-api.coingecko.com\", \"api_key\": \"YOUR_KEY\", \"timeout_secs\": 10 }, \"espo_pricer_host\": \"http://127.0.0.1:6901\", \"use_historical_backfill\": <bool=true>, \"pre_ammdata_btc_usd_price\": <86500 or \"86500.12\">, \"store_price_every_block\": <bool=true>, \"search_index_enabled\": <bool>, \"search_prefix_min\": <2>, \"search_prefix_max\": <6>, \"search_fallback_scan_cap\": <num>, \"search_limit_cap\": <num>, \"derived_liquidity\": [ { \"alkane\": \"2:0\", \"strategy\": \"neutral|neutral-vwap|optimistic|pessimistic\" } ] }"
     }
 
     pub fn from_value(value: &Value) -> Result<Self> {
         let obj = value.as_object().ok_or_else(|| {
             anyhow!("ammdata config must be an object; expected: {}", Self::spec())
         })?;
+        
+        // Parse CoinGecko config (optional)
+        let coingecko = match obj.get("coingecko") {
+            None | Some(Value::Null) => None,
+            Some(cg_val) => {
+                let cg_obj = cg_val.as_object().ok_or_else(|| {
+                    anyhow!("ammdata.coingecko must be an object; expected: {}", Self::spec())
+                })?;
+                let api_url = cg_obj
+                    .get("api_url")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("https://pro-api.coingecko.com")
+                    .to_string();
+                let api_key = cg_obj
+                    .get("api_key")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("ammdata.coingecko.api_key is required"))?
+                    .to_string();
+                let timeout_secs = cg_obj
+                    .get("timeout_secs")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(10);
+                Some(CoinGeckoConfig { api_url, api_key, timeout_secs })
+            }
+        };
+        
         let espo_pricer_host_val = obj.get("espo_pricer_host").ok_or_else(|| {
             anyhow!("ammdata.espo_pricer_host missing; expected: {}", Self::spec())
         })?;
@@ -58,6 +93,8 @@ impl AmmDataConfig {
             .map(parse_scaled_price_value)
             .transpose()?
             .unwrap_or(0);
+        let store_price_every_block =
+            obj.get("store_price_every_block").and_then(|v| v.as_bool()).unwrap_or(true);
 
         let search_index_enabled =
             obj.get("search_index_enabled").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -148,9 +185,11 @@ impl AmmDataConfig {
         };
 
         Ok(Self {
+            coingecko,
             espo_pricer_host,
             use_historical_backfill,
             pre_ammdata_btc_usd_price,
+            store_price_every_block,
             search_index_enabled,
             search_prefix_min_len,
             search_prefix_max_len,

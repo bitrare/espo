@@ -52,6 +52,22 @@
     "runes": {
       "enable": false,
       "load_live_outpoints": true
+    },
+    "ammdata": {
+      "coingecko": {
+        "api_url": "https://pro-api.coingecko.com",
+        "api_key": "YOUR_COINGECKO_API_KEY",
+        "timeout_secs": 10
+      },
+      "espo_pricer_host": "http://127.0.0.1:6901",
+      "use_historical_backfill": true,
+      "store_price_every_block": true,
+      "pre_ammdata_btc_usd_price": 100000,
+      "search_index_enabled": false,
+      "search_prefix_min": 2,
+      "search_prefix_max": 6,
+      "search_fallback_scan_cap": 5000,
+      "search_limit_cap": 20
     }
   }
 }

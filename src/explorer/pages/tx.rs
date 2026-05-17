@@ -24,12 +24,12 @@ use crate::explorer::components::header::{
 };
 use crate::explorer::components::layout::layout_with_meta;
 use crate::explorer::components::svg_assets::icon_arrow_up_right;
-use crate::explorer::components::tx_view::{TxPill, TxPillTone, render_tx};
+use crate::explorer::components::tx_view::{TxPill, TxPillTone, TxTypePill, render_tx};
 use crate::explorer::pages::block::mempool_block_projected_balances;
 use crate::explorer::pages::common::format_fee_rate;
 use crate::explorer::pages::state::ExplorerState;
 use crate::explorer::paths::explorer_path;
-use crate::modules::essentials::storage::BalanceEntry;
+use crate::modules::essentials::storage::{BalanceEntry, TxType, load_tx_summary_v2, EssentialsProvider};
 use crate::modules::essentials::utils::balances::{
     OutpointLookup, get_outpoint_balances_with_spent, get_outpoint_balances_with_spent_batch,
 };
@@ -640,6 +640,13 @@ pub async fn tx_page(State(state): State<ExplorerState>, Path(txid_str): Path<St
     };
     let projected_rune_io =
         if tx_height.is_none() { mempool_projected_rune_io.as_ref() } else { None };
+    
+    let tx_type_pill = if tx_height.is_some() {
+        let summary = load_tx_summary_v2(&state.essentials_provider(), &txid);
+        summary.as_ref().and_then(|s| s.tx_type.as_ref()).map(TxTypePill::from_tx_type)
+    } else {
+        None
+    };
 
     let mut summary_items: Vec<HeaderSummaryItem> = Vec::new();
     summary_items.push(HeaderSummaryItem {
@@ -712,7 +719,7 @@ pub async fn tx_page(State(state): State<ExplorerState>, Path(txid_str): Path<St
                 }
             }
             h2 class="h2" { "Inputs & Outputs" }
-            (render_tx(&txid, &tx, traces_ref, state.network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb, tx_pill, render_fee_rate, projected_balances, projected_rune_io, false, defer_alkane_trace_status))
+            (render_tx(&txid, &tx, traces_ref, state.network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb, tx_pill, render_fee_rate, projected_balances, projected_rune_io, false, defer_alkane_trace_status, tx_type_pill))
             (header_scripts())
             (tx_event_listener_script(&txid))
         },

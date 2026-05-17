@@ -1454,6 +1454,39 @@ a:hover {
   color: #fff;
   white-space: nowrap;
 }
+/* Transaction type pills */
+.tx-type-diesel-mint {
+  background: rgba(128, 128, 128, 0.2);
+  color: #a0a0a0;
+}
+.tx-type-mint {
+  background: rgba(51, 225, 131, 0.15);
+  color: var(--success);
+}
+.tx-type-transfer {
+  background: rgba(170, 200, 255, 0.15);
+  color: var(--link);
+}
+.tx-type-marketplace {
+  background: rgba(180, 130, 255, 0.2);
+  color: #c99aff;
+}
+.tx-type-swap {
+  background: rgba(253, 169, 72, 0.15);
+  color: var(--warning);
+}
+.tx-type-deploy {
+  background: rgba(255, 120, 180, 0.2);
+  color: #ff9dc7;
+}
+.tx-type-contract {
+  background: rgba(255, 220, 100, 0.15);
+  color: #f0d060;
+}
+.tx-type-unknown {
+  background: rgba(128, 128, 128, 0.15);
+  color: var(--muted);
+}
 .tx-title {
   padding: 12px;
   margin-top: 0;

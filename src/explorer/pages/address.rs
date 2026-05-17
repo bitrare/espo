@@ -27,7 +27,7 @@ use crate::explorer::components::svg_assets::{
     icon_pager_right,
 };
 use crate::explorer::components::tx_view::{
-    AlkaneMetaCache, TxPill, TxPillTone, alkane_meta, icon_bg_style, render_tx,
+    AlkaneMetaCache, TxPill, TxPillTone, TxTypePill, alkane_meta, icon_bg_style, render_tx,
 };
 use crate::explorer::consts::{DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT};
 use crate::explorer::pages::common::fmt_sats;
@@ -35,7 +35,7 @@ use crate::explorer::pages::state::ExplorerState;
 use crate::explorer::paths::{current_language, explorer_path};
 use crate::modules::essentials::storage::BalanceEntry;
 use crate::modules::essentials::storage::{
-    AddressIndexListKind, AlkaneTxSummary, get_address_index_list_len,
+    AddressIndexListKind, AlkaneTxSummary, TxType, get_address_index_list_len,
     get_address_index_list_range, load_outpoint_pointer_blob_v3_by_id,
     load_tx_pointer_blob_v3_by_id, load_tx_summary_v2,
 };
@@ -105,6 +105,7 @@ struct AddressTxRender {
     position: Option<MempoolProjectedPosition>,
     confirmations: Option<u64>,
     is_mempool: bool,
+    tx_type: Option<TxType>,
 }
 
 #[derive(Clone)]
@@ -540,6 +541,7 @@ pub async fn address_page(
             position: entry.position.clone(),
             confirmations: None,
             is_mempool: true,
+            tx_type: None,
         });
     }
 
@@ -600,6 +602,7 @@ pub async fn address_page(
                     .as_ref()
                     .map(|s| traces_from_summary(txid, s))
                     .filter(|t| !t.is_empty());
+                let tx_type = summary.as_ref().and_then(|s| s.tx_type.clone());
                 tx_renders.push(AddressTxRender {
                     txid: *txid,
                     tx,
@@ -608,6 +611,7 @@ pub async fn address_page(
                     position: None,
                     confirmations,
                     is_mempool: false,
+                    tx_type,
                 });
             }
         }
@@ -701,6 +705,7 @@ pub async fn address_page(
                 if traces.is_some() {
                     traces_hits = traces_hits.saturating_add(1);
                 }
+                let tx_type = summary.as_ref().and_then(|s| s.tx_type.clone());
 
                 tx_renders.push(AddressTxRender {
                     txid: *txid,
@@ -710,6 +715,7 @@ pub async fn address_page(
                     position: None,
                     confirmations,
                     is_mempool: false,
+                    tx_type,
                 });
             }
             log_address_page_perf(
@@ -793,6 +799,7 @@ pub async fn address_page(
                     .as_ref()
                     .map(|s| traces_from_summary(txid, s))
                     .filter(|t| !t.is_empty());
+                let tx_type = summary.as_ref().and_then(|s| s.tx_type.clone());
                 tx_renders.push(AddressTxRender {
                     txid: *txid,
                     tx,
@@ -801,6 +808,7 @@ pub async fn address_page(
                     position: None,
                     confirmations,
                     is_mempool: false,
+                    tx_type,
                 });
             }
         }
@@ -892,6 +900,7 @@ pub async fn address_page(
                                 chain_tip
                                     .and_then(|tip| if tip >= h { Some(tip - h + 1) } else { None })
                             });
+                            let tx_type = summary.as_ref().and_then(|s| s.tx_type.clone());
                             tx_renders.push(AddressTxRender {
                                 txid: entry.txid,
                                 tx,
@@ -900,6 +909,7 @@ pub async fn address_page(
                                 position: None,
                                 confirmations,
                                 is_mempool: false,
+                                tx_type,
                             });
                         }
                         log_address_page_perf(
@@ -1520,7 +1530,8 @@ pub async fn address_page(
                             } else {
                                 None
                             };
-                            (render_tx(&item.txid, &item.tx, traces_ref, state.network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb, pill, None, projected_balances, projected_rune_io, true, false))
+                            @let tx_type_pill = item.tx_type.as_ref().map(TxTypePill::from_tx_type);
+                            (render_tx(&item.txid, &item.tx, traces_ref, state.network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb, pill, None, projected_balances, projected_rune_io, true, false, tx_type_pill))
                         }
                     }
 

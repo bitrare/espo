@@ -5187,6 +5187,67 @@ impl EssentialsProvider {
         )
         .unwrap_or_default();
 
+        // Identify transfers without traces that need raw_tx_data for marketplace detection
+        // and collect their previous transaction txids for prevout value lookup
+        let mut needs_raw_tx_data: HashSet<Txid> = HashSet::new();
+        let mut prev_txids_to_fetch: HashSet<Txid> = HashSet::new();
+        
+        for txid in &page_txids {
+            if let Some(summary) = load_tx_summary_v2(self, txid) {
+                // Include raw_tx_data for transfers without traces (potential marketplace transactions)
+                if summary.tx_type == TxType::Transfer && summary.traces.is_empty() {
+                    needs_raw_tx_data.insert(*txid);
+                    
+                    // Collect previous txids for this transaction
+                    if let Some(tx) = decoded_txs.get(txid) {
+                        for vin in &tx.input {
+                            if !vin.previous_output.is_null() {
+                                prev_txids_to_fetch.insert(vin.previous_output.txid);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Batch fetch previous transactions for prevout values (only if needed)
+        let prev_txs: HashMap<Txid, Transaction> = if !prev_txids_to_fetch.is_empty() {
+            let prev_txid_vec: Vec<Txid> = prev_txids_to_fetch.into_iter().collect();
+            let prev_raw_txs = electrum_like
+                .batch_transaction_get_raw(&prev_txid_vec)
+                .unwrap_or_default();
+            
+            prev_txid_vec.iter().enumerate()
+                .filter_map(|(idx, txid)| {
+                    prev_raw_txs.get(idx)
+                        .and_then(|raw| deserialize::<Transaction>(raw).ok())
+                        .map(|tx| (*txid, tx))
+                })
+                .collect()
+        } else {
+            HashMap::new()
+        };
+
+        // Get block time from block summary
+        let block_time: Option<u32> = self
+            .get_block_summary(GetBlockSummaryParams {
+                blockhash: StateAt::Latest,
+                height: height as u32,
+            })
+            .ok()
+            .and_then(|r| r.summary)
+            .and_then(|s| {
+                // Block header is 80 bytes, timestamp is at bytes 68-71 (little-endian u32)
+                if s.header.len() >= 72 {
+                    Some(u32::from_le_bytes([s.header[68], s.header[69], s.header[70], s.header[71]]))
+                } else {
+                    None
+                }
+            });
+
+        // Get network for address derivation
+        let network = get_network();
+
         // Helper to convert balances to JSON
         let balances_to_json = |balances: &[BalanceEntry]| -> Vec<Value> {
             balances
@@ -5282,6 +5343,59 @@ impl EssentialsProvider {
                 Value::Null
             };
 
+            // Build raw_tx_data for transfers without traces (for marketplace detection)
+            let raw_tx_data_json = if needs_raw_tx_data.contains(txid) {
+                if let Some(tx) = decoded_txs.get(txid) {
+                    // Build vin array with witness and prevout data
+                    let vin_json: Vec<Value> = tx.input.iter().enumerate().map(|(_idx, vin)| {
+                        let mut obj = json!({
+                            "txid": vin.previous_output.txid.to_string(),
+                            "vout": vin.previous_output.vout,
+                        });
+                        
+                        // Add witness data (for SIGHASH_SINGLE detection)
+                        if !vin.witness.is_empty() {
+                            obj["witness"] = json!(vin.witness.iter()
+                                .map(|w| hex::encode(w))
+                                .collect::<Vec<_>>());
+                        }
+                        
+                        // Add prevout value and address from previous transaction
+                        if let Some(prev_tx) = prev_txs.get(&vin.previous_output.txid) {
+                            if let Some(prev_out) = prev_tx.output.get(vin.previous_output.vout as usize) {
+                                obj["prevout_value"] = json!(prev_out.value.to_sat());
+                                if let Ok(addr) = Address::from_script(prev_out.script_pubkey.as_script(), network) {
+                                    obj["prevout_address"] = json!(addr.to_string());
+                                }
+                            }
+                        }
+                        
+                        obj
+                    }).collect();
+                    
+                    // Build vout array with value and address
+                    let vout_json: Vec<Value> = tx.output.iter().map(|out| {
+                        let mut obj = json!({
+                            "value": out.value.to_sat(),
+                        });
+                        if let Ok(addr) = Address::from_script(out.script_pubkey.as_script(), network) {
+                            obj["address"] = json!(addr.to_string());
+                        }
+                        obj
+                    }).collect();
+                    
+                    Some(json!({
+                        "vin": vin_json,
+                        "vout": vout_json,
+                        "block_time": block_time,
+                    }))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
             transactions.push(json!({
                 "txid": txid.to_string(),
                 "height": summary.height,
@@ -5290,6 +5404,7 @@ impl EssentialsProvider {
                 "traces": traces_json,
                 "outflows": outflows_json,
                 "balance_changes": balance_changes_json,
+                "raw_tx_data": raw_tx_data_json,
             }));
         }
 

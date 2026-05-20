@@ -4797,6 +4797,95 @@ impl EssentialsProvider {
             })
         });
 
+        // Fetch balance_changes for this transaction
+        let balance_changes_json = {
+            let electrum_like = get_electrum_like();
+            let raw_tx = electrum_like.transaction_get_raw(&txid).ok();
+            
+            if let Some(raw) = raw_tx {
+                if let Ok(tx) = deserialize::<Transaction>(&raw) {
+                    // Collect all outpoints
+                    let mut all_outpoints: Vec<(Txid, u32)> = Vec::new();
+                    for vin in &tx.input {
+                        if !vin.previous_output.is_null() {
+                            all_outpoints.push((vin.previous_output.txid, vin.previous_output.vout));
+                        }
+                    }
+                    for vout in 0..tx.output.len() {
+                        all_outpoints.push((txid, vout as u32));
+                    }
+                    all_outpoints.sort();
+                    all_outpoints.dedup();
+
+                    // Fetch balance data
+                    let outpoint_balances = get_outpoint_balances_with_spent_batch(
+                        StateAt::Latest,
+                        self,
+                        &all_outpoints,
+                    )
+                    .unwrap_or_default();
+
+                    let balances_to_json = |balances: &[BalanceEntry]| -> Vec<Value> {
+                        balances
+                            .iter()
+                            .map(|b| {
+                                json!({
+                                    "alkane": format!("{}:{}", b.alkane.block, b.alkane.tx),
+                                    "amount": b.amount.to_string(),
+                                })
+                            })
+                            .collect()
+                    };
+
+                    let mut inputs_json: Vec<Value> = Vec::new();
+                    for (vin_idx, vin) in tx.input.iter().enumerate() {
+                        if vin.previous_output.is_null() {
+                            continue;
+                        }
+                        let outpoint_key = (vin.previous_output.txid, vin.previous_output.vout);
+                        if let Some(lookup) = outpoint_balances.get(&outpoint_key) {
+                            if !lookup.balances.is_empty() {
+                                inputs_json.push(json!({
+                                    "vin": vin_idx,
+                                    "outpoint": format!("{}:{}", vin.previous_output.txid, vin.previous_output.vout),
+                                    "address": lookup.address,
+                                    "balances": balances_to_json(&lookup.balances),
+                                }));
+                            }
+                        }
+                    }
+
+                    let mut outputs_json: Vec<Value> = Vec::new();
+                    for vout in 0..tx.output.len() {
+                        let outpoint_key = (txid, vout as u32);
+                        if let Some(lookup) = outpoint_balances.get(&outpoint_key) {
+                            if !lookup.balances.is_empty() {
+                                outputs_json.push(json!({
+                                    "vout": vout,
+                                    "outpoint": format!("{}:{}", txid, vout),
+                                    "address": lookup.address,
+                                    "balances": balances_to_json(&lookup.balances),
+                                }));
+                            }
+                        }
+                    }
+
+                    if inputs_json.is_empty() && outputs_json.is_empty() {
+                        Value::Null
+                    } else {
+                        json!({
+                            "inputs": inputs_json,
+                            "outputs": outputs_json,
+                        })
+                    }
+                } else {
+                    Value::Null
+                }
+            } else {
+                Value::Null
+            }
+        };
+
         Ok(RpcGetAlkaneTxSummaryResult {
             value: json!({
                 "ok": true,
@@ -4806,6 +4895,7 @@ impl EssentialsProvider {
                 "marketplace_info": marketplace_json,
                 "traces": traces_json,
                 "outflows": outflows_json,
+                "balance_changes": balance_changes_json,
             }),
         })
     }
@@ -4946,7 +5036,7 @@ impl EssentialsProvider {
             });
         };
         let page = params.page.unwrap_or(1).max(1) as usize;
-        let limit = params.limit.unwrap_or(50).max(1).min(100) as usize; // Cap at 100 for full summaries
+        let limit = params.limit.unwrap_or(50).max(1).min(100) as usize;
         let off = limit.saturating_mul(page.saturating_sub(1));
         let hide_diesel = params.hide_diesel_mints.unwrap_or(false);
         let filter_tx_type = params.tx_type.as_deref().and_then(TxType::from_str);
@@ -4973,10 +5063,151 @@ impl EssentialsProvider {
             });
         }
 
-        // Helper closure to build full tx summary JSON
-        let build_tx_json = |txid: &Txid| -> Option<Value> {
-            let summary = load_tx_summary_v2(self, txid)?;
-            
+        // Collect txids for the page (with optional filtering)
+        let (page_txids, total_count): (Vec<Txid>, usize) = if !needs_filtering {
+            let end = (off + limit).min(raw_total);
+            let ids = if end > off {
+                get_address_index_list_range(
+                    self,
+                    StateAt::Latest,
+                    AddressIndexListKind::AlkaneBlockTxs,
+                    &list_id,
+                    off as u64,
+                    end as u64,
+                )
+                .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let txids: Vec<Txid> = ids
+                .into_iter()
+                .filter_map(|id| {
+                    load_tx_pointer_blob_v3_by_id(self, id)
+                        .map(|blob| Txid::from_byte_array(blob.txid))
+                })
+                .collect();
+            (txids, raw_total)
+        } else {
+            // Slow path: filter by tx_type and/or hide diesel mints
+            let all_ids = get_address_index_list_range(
+                self,
+                StateAt::Latest,
+                AddressIndexListKind::AlkaneBlockTxs,
+                &list_id,
+                0,
+                raw_total as u64,
+            )
+            .unwrap_or_default();
+
+            let mut filtered_txids: Vec<Txid> = Vec::new();
+            for id in all_ids {
+                let Some(blob) = load_tx_pointer_blob_v3_by_id(self, id) else {
+                    continue;
+                };
+                let txid = Txid::from_byte_array(blob.txid);
+
+                if let Some(wanted_type) = filter_tx_type {
+                    if blob.tx_type != wanted_type {
+                        continue;
+                    }
+                }
+                if hide_diesel && blob.tx_type == TxType::DieselMint {
+                    continue;
+                }
+                filtered_txids.push(txid);
+            }
+
+            let filtered_total = filtered_txids.len();
+            let end = (off + limit).min(filtered_total);
+            let page_slice = if end > off {
+                filtered_txids[off..end].to_vec()
+            } else {
+                Vec::new()
+            };
+            (page_slice, filtered_total)
+        };
+
+        if page_txids.is_empty() {
+            return Ok(RpcGetAlkaneBlockTxsFullResult {
+                value: json!({
+                    "ok": true,
+                    "height": height,
+                    "page": page,
+                    "limit": limit,
+                    "total": total_count,
+                    "transactions": []
+                }),
+            });
+        }
+
+        // Batch fetch raw transactions to get input/output outpoints
+        let electrum_like = get_electrum_like();
+        let raw_txs = electrum_like
+            .batch_transaction_get_raw(&page_txids)
+            .unwrap_or_default();
+
+        // Decode transactions and collect all outpoints we need balances for
+        let mut decoded_txs: HashMap<Txid, Transaction> = HashMap::new();
+        let mut all_outpoints: Vec<(Txid, u32)> = Vec::new();
+
+        for (idx, txid) in page_txids.iter().enumerate() {
+            let raw = raw_txs.get(idx).cloned().unwrap_or_default();
+            if raw.is_empty() {
+                continue;
+            }
+            let tx: Transaction = match deserialize(&raw) {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+
+            // Collect input outpoints (previous outputs being spent)
+            for vin in &tx.input {
+                if !vin.previous_output.is_null() {
+                    all_outpoints.push((vin.previous_output.txid, vin.previous_output.vout));
+                }
+            }
+
+            // Collect output outpoints (this tx's outputs)
+            for vout in 0..tx.output.len() {
+                all_outpoints.push((*txid, vout as u32));
+            }
+
+            decoded_txs.insert(*txid, tx);
+        }
+
+        // Deduplicate outpoints
+        all_outpoints.sort();
+        all_outpoints.dedup();
+
+        // Batch fetch balance data for all outpoints
+        let outpoint_balances = get_outpoint_balances_with_spent_batch(
+            StateAt::Latest,
+            self,
+            &all_outpoints,
+        )
+        .unwrap_or_default();
+
+        // Helper to convert balances to JSON
+        let balances_to_json = |balances: &[BalanceEntry]| -> Vec<Value> {
+            balances
+                .iter()
+                .map(|b| {
+                    json!({
+                        "alkane": format!("{}:{}", b.alkane.block, b.alkane.tx),
+                        "amount": b.amount.to_string(),
+                    })
+                })
+                .collect()
+        };
+
+        // Build transaction JSON with balance_changes
+        let mut transactions: Vec<Value> = Vec::new();
+        for txid in &page_txids {
+            let summary = match load_tx_summary_v2(self, txid) {
+                Some(s) => s,
+                None => continue,
+            };
+
             let traces_json = serde_json::to_value(&summary.traces).unwrap_or(Value::Null);
             let mut outflows_json: Vec<Value> = Vec::new();
             for entry in &summary.outflows {
@@ -5003,102 +5234,63 @@ impl EssentialsProvider {
                 })
             });
 
-            Some(json!({
+            // Build balance_changes from decoded transaction
+            let balance_changes_json = if let Some(tx) = decoded_txs.get(txid) {
+                let mut inputs_json: Vec<Value> = Vec::new();
+                for (vin_idx, vin) in tx.input.iter().enumerate() {
+                    if vin.previous_output.is_null() {
+                        continue;
+                    }
+                    let outpoint_key = (vin.previous_output.txid, vin.previous_output.vout);
+                    if let Some(lookup) = outpoint_balances.get(&outpoint_key) {
+                        if !lookup.balances.is_empty() {
+                            inputs_json.push(json!({
+                                "vin": vin_idx,
+                                "outpoint": format!("{}:{}", vin.previous_output.txid, vin.previous_output.vout),
+                                "address": lookup.address,
+                                "balances": balances_to_json(&lookup.balances),
+                            }));
+                        }
+                    }
+                }
+
+                let mut outputs_json: Vec<Value> = Vec::new();
+                for vout in 0..tx.output.len() {
+                    let outpoint_key = (*txid, vout as u32);
+                    if let Some(lookup) = outpoint_balances.get(&outpoint_key) {
+                        if !lookup.balances.is_empty() {
+                            outputs_json.push(json!({
+                                "vout": vout,
+                                "outpoint": format!("{}:{}", txid, vout),
+                                "address": lookup.address,
+                                "balances": balances_to_json(&lookup.balances),
+                            }));
+                        }
+                    }
+                }
+
+                // Only include if there are actual balance changes
+                if inputs_json.is_empty() && outputs_json.is_empty() {
+                    Value::Null
+                } else {
+                    json!({
+                        "inputs": inputs_json,
+                        "outputs": outputs_json,
+                    })
+                }
+            } else {
+                Value::Null
+            };
+
+            transactions.push(json!({
                 "txid": txid.to_string(),
                 "height": summary.height,
                 "tx_type": summary.tx_type.as_str(),
                 "marketplace_info": marketplace_json,
                 "traces": traces_json,
                 "outflows": outflows_json,
-            }))
-        };
-
-        if !needs_filtering {
-            // Fast path: no filtering needed
-            let end = (off + limit).min(raw_total);
-            let ids = if end > off {
-                get_address_index_list_range(
-                    self,
-                    StateAt::Latest,
-                    AddressIndexListKind::AlkaneBlockTxs,
-                    &list_id,
-                    off as u64,
-                    end as u64,
-                )
-                .unwrap_or_default()
-            } else {
-                Vec::new()
-            };
-            
-            let mut transactions: Vec<Value> = Vec::new();
-            for id in ids {
-                let Some(blob) = load_tx_pointer_blob_v3_by_id(self, id) else {
-                    continue;
-                };
-                let txid = Txid::from_byte_array(blob.txid);
-                if let Some(tx_json) = build_tx_json(&txid) {
-                    transactions.push(tx_json);
-                }
-            }
-            
-            return Ok(RpcGetAlkaneBlockTxsFullResult {
-                value: json!({
-                    "ok": true,
-                    "height": height,
-                    "page": page,
-                    "limit": limit,
-                    "total": raw_total,
-                    "transactions": transactions
-                }),
-            });
-        }
-
-        // Slow path: filter by tx_type and/or hide diesel mints, then paginate
-        let all_ids = get_address_index_list_range(
-            self,
-            StateAt::Latest,
-            AddressIndexListKind::AlkaneBlockTxs,
-            &list_id,
-            0,
-            raw_total as u64,
-        )
-        .unwrap_or_default();
-
-        let mut filtered_txids: Vec<Txid> = Vec::new();
-        for id in all_ids {
-            let Some(blob) = load_tx_pointer_blob_v3_by_id(self, id) else {
-                continue;
-            };
-            let txid = Txid::from_byte_array(blob.txid);
-
-            // Filter by tx_type if specified
-            if let Some(wanted_type) = filter_tx_type {
-                if blob.tx_type != wanted_type {
-                    continue;
-                }
-            }
-
-            // Hide diesel mints if requested
-            if hide_diesel && blob.tx_type == TxType::DieselMint {
-                continue;
-            }
-
-            filtered_txids.push(txid);
-        }
-
-        let filtered_total = filtered_txids.len();
-        let end = (off + limit).min(filtered_total);
-        let page_txids = if end > off {
-            &filtered_txids[off..end]
-        } else {
-            &[]
-        };
-
-        let mut transactions: Vec<Value> = Vec::new();
-        for txid in page_txids {
-            if let Some(tx_json) = build_tx_json(txid) {
-                transactions.push(tx_json);
-            }
+                "balance_changes": balance_changes_json,
+            }));
         }
 
         Ok(RpcGetAlkaneBlockTxsFullResult {
@@ -5107,7 +5299,7 @@ impl EssentialsProvider {
                 "height": height,
                 "page": page,
                 "limit": limit,
-                "total": filtered_total,
+                "total": total_count,
                 "transactions": transactions
             }),
         })

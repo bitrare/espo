@@ -4935,6 +4935,184 @@ impl EssentialsProvider {
         })
     }
 
+    /// Get alkane block transactions with full tx summaries (tx_type, traces, outflows, marketplace_info)
+    pub fn rpc_get_alkane_block_txs_full(
+        &self,
+        params: RpcGetAlkaneBlockTxsFullParams,
+    ) -> Result<RpcGetAlkaneBlockTxsFullResult> {
+        let Some(height) = params.height else {
+            return Ok(RpcGetAlkaneBlockTxsFullResult {
+                value: json!({"ok": false, "error": "missing_or_invalid_height"}),
+            });
+        };
+        let page = params.page.unwrap_or(1).max(1) as usize;
+        let limit = params.limit.unwrap_or(50).max(1).min(100) as usize; // Cap at 100 for full summaries
+        let off = limit.saturating_mul(page.saturating_sub(1));
+        let hide_diesel = params.hide_diesel_mints.unwrap_or(false);
+        let filter_tx_type = params.tx_type.as_deref().and_then(TxType::from_str);
+        let needs_filtering = hide_diesel || filter_tx_type.is_some();
+        let list_id = address_index_list_id_alkane_block_txs(height);
+        let raw_total = get_address_index_list_len(
+            self,
+            StateAt::Latest,
+            AddressIndexListKind::AlkaneBlockTxs,
+            &list_id,
+        )
+        .unwrap_or(0) as usize;
+
+        if raw_total == 0 {
+            return Ok(RpcGetAlkaneBlockTxsFullResult {
+                value: json!({
+                    "ok": true,
+                    "height": height,
+                    "page": page,
+                    "limit": limit,
+                    "total": 0,
+                    "transactions": []
+                }),
+            });
+        }
+
+        // Helper closure to build full tx summary JSON
+        let build_tx_json = |txid: &Txid| -> Option<Value> {
+            let summary = load_tx_summary_v2(self, txid)?;
+            
+            let traces_json = serde_json::to_value(&summary.traces).unwrap_or(Value::Null);
+            let mut outflows_json: Vec<Value> = Vec::new();
+            for entry in &summary.outflows {
+                let mut outflow_map = Map::new();
+                for (alk, delta) in &entry.outflow {
+                    outflow_map.insert(
+                        format!("{}:{}", alk.block, alk.tx),
+                        Value::String(delta.to_string()),
+                    );
+                }
+                outflows_json.push(json!({
+                    "txid": Txid::from_byte_array(entry.txid).to_string(),
+                    "height": entry.height,
+                    "outflow": outflow_map,
+                }));
+            }
+
+            let marketplace_json = summary.marketplace_info.as_ref().map(|info| {
+                json!({
+                    "marketplace_id": info.marketplace_id,
+                    "marketplace_name": info.marketplace_name,
+                    "fee_address": info.fee_address,
+                    "fee_sats": info.fee_sats,
+                })
+            });
+
+            Some(json!({
+                "txid": txid.to_string(),
+                "height": summary.height,
+                "tx_type": summary.tx_type.as_str(),
+                "marketplace_info": marketplace_json,
+                "traces": traces_json,
+                "outflows": outflows_json,
+            }))
+        };
+
+        if !needs_filtering {
+            // Fast path: no filtering needed
+            let end = (off + limit).min(raw_total);
+            let ids = if end > off {
+                get_address_index_list_range(
+                    self,
+                    StateAt::Latest,
+                    AddressIndexListKind::AlkaneBlockTxs,
+                    &list_id,
+                    off as u64,
+                    end as u64,
+                )
+                .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            
+            let mut transactions: Vec<Value> = Vec::new();
+            for id in ids {
+                let Some(blob) = load_tx_pointer_blob_v3_by_id(self, id) else {
+                    continue;
+                };
+                let txid = Txid::from_byte_array(blob.txid);
+                if let Some(tx_json) = build_tx_json(&txid) {
+                    transactions.push(tx_json);
+                }
+            }
+            
+            return Ok(RpcGetAlkaneBlockTxsFullResult {
+                value: json!({
+                    "ok": true,
+                    "height": height,
+                    "page": page,
+                    "limit": limit,
+                    "total": raw_total,
+                    "transactions": transactions
+                }),
+            });
+        }
+
+        // Slow path: filter by tx_type and/or hide diesel mints, then paginate
+        let all_ids = get_address_index_list_range(
+            self,
+            StateAt::Latest,
+            AddressIndexListKind::AlkaneBlockTxs,
+            &list_id,
+            0,
+            raw_total as u64,
+        )
+        .unwrap_or_default();
+
+        let mut filtered_txids: Vec<Txid> = Vec::new();
+        for id in all_ids {
+            let Some(blob) = load_tx_pointer_blob_v3_by_id(self, id) else {
+                continue;
+            };
+            let txid = Txid::from_byte_array(blob.txid);
+
+            // Filter by tx_type if specified
+            if let Some(wanted_type) = filter_tx_type {
+                if blob.tx_type != wanted_type {
+                    continue;
+                }
+            }
+
+            // Hide diesel mints if requested
+            if hide_diesel && blob.tx_type == TxType::DieselMint {
+                continue;
+            }
+
+            filtered_txids.push(txid);
+        }
+
+        let filtered_total = filtered_txids.len();
+        let end = (off + limit).min(filtered_total);
+        let page_txids = if end > off {
+            &filtered_txids[off..end]
+        } else {
+            &[]
+        };
+
+        let mut transactions: Vec<Value> = Vec::new();
+        for txid in page_txids {
+            if let Some(tx_json) = build_tx_json(txid) {
+                transactions.push(tx_json);
+            }
+        }
+
+        Ok(RpcGetAlkaneBlockTxsFullResult {
+            value: json!({
+                "ok": true,
+                "height": height,
+                "page": page,
+                "limit": limit,
+                "total": filtered_total,
+                "transactions": transactions
+            }),
+        })
+    }
+
     pub fn rpc_get_alkane_address_txs(
         &self,
         params: RpcGetAlkaneAddressTxsParams,
@@ -5943,6 +6121,19 @@ pub struct RpcGetAlkaneBlockTxsParams {
 }
 
 pub struct RpcGetAlkaneBlockTxsResult {
+    pub value: Value,
+}
+
+pub struct RpcGetAlkaneBlockTxsFullParams {
+    pub height: Option<u64>,
+    pub page: Option<u64>,
+    pub limit: Option<u64>,
+    pub hide_diesel_mints: Option<bool>,
+    /// Filter by transaction type (e.g., "diesel_mint", "mint", "transfer", "marketplace", etc.)
+    pub tx_type: Option<String>,
+}
+
+pub struct RpcGetAlkaneBlockTxsFullResult {
     pub value: Value,
 }
 

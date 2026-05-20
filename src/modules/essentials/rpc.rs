@@ -5,11 +5,12 @@ use crate::modules::essentials::storage::{
     RpcGetAddressTransactionsParams, RpcGetAlkaneAddressTxsParams,
     RpcGetAlkaneBalanceMetashrewParams, RpcGetAlkaneBalanceTxsByTokenParams,
     RpcGetAlkaneBalanceTxsParams, RpcGetAlkaneBalancesParams, RpcGetAlkaneBlockTxsParams,
-    RpcGetAlkaneInfoParams, RpcGetAlkaneLatestTracesParams, RpcGetAlkaneTxSummaryParams,
-    RpcGetAllAlkanesParams, RpcGetBlockSummaryParams, RpcGetBlockTracesParams,
-    RpcGetCirculatingSupplyParams, RpcGetHoldersCountParams, RpcGetHoldersParams, RpcGetKeysParams,
-    RpcGetKnownMarketplacesParams, RpcGetMempoolTracesParams, RpcGetOutpointBalancesParams,
-    RpcGetTotalReceivedParams, RpcGetTransferVolumeParams, RpcGetTxTypesParams, RpcPingParams,
+    RpcGetAlkaneBlockTxsFullParams, RpcGetAlkaneInfoParams, RpcGetAlkaneLatestTracesParams,
+    RpcGetAlkaneTxSummaryParams, RpcGetAllAlkanesParams, RpcGetBlockSummaryParams,
+    RpcGetBlockTracesParams, RpcGetCirculatingSupplyParams, RpcGetHoldersCountParams,
+    RpcGetHoldersParams, RpcGetKeysParams, RpcGetKnownMarketplacesParams, RpcGetMempoolTracesParams,
+    RpcGetOutpointBalancesParams, RpcGetTotalReceivedParams, RpcGetTransferVolumeParams,
+    RpcGetTxTypesParams, RpcPingParams,
 };
 use crate::runtime::mempool::current_mempool_memory_stats;
 use serde_json::{Value, json};
@@ -680,6 +681,34 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                             tx_type: payload.get("tx_type").and_then(|v| v.as_str()).map(|s| s.to_string()),
                         };
                         view.rpc_get_alkane_block_txs(params)
+                            .map(|resp| resp.value)
+                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                    }
+                })
+                .await;
+        });
+    }
+
+    {
+        let reg_block_txs_full = reg.clone();
+        let mdb_block_txs_full = Arc::clone(&mdb);
+        tokio::spawn(async move {
+            reg_block_txs_full
+                .register("get_alkane_block_txs_full", move |_cx, payload| {
+                    let mdb = Arc::clone(&mdb_block_txs_full);
+                    async move {
+                        let view = match resolve_view(mdb.as_ref(), &payload) {
+                            Ok(v) => v,
+                            Err(err) => return err,
+                        };
+                        let params = RpcGetAlkaneBlockTxsFullParams {
+                            height: payload.get("height").and_then(|v| v.as_u64()),
+                            page: payload.get("page").and_then(|v| v.as_u64()),
+                            limit: payload.get("limit").and_then(|v| v.as_u64()),
+                            hide_diesel_mints: payload.get("hide_diesel_mints").and_then(|v| v.as_bool()),
+                            tx_type: payload.get("tx_type").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                        };
+                        view.rpc_get_alkane_block_txs_full(params)
                             .map(|resp| resp.value)
                             .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
                     }

@@ -5051,10 +5051,26 @@ impl EssentialsProvider {
         .unwrap_or(0) as usize;
 
         if raw_total == 0 {
+            // Get block time even for empty blocks
+            let block_time: Option<u32> = self
+                .get_block_summary(GetBlockSummaryParams {
+                    blockhash: StateAt::Latest,
+                    height: height as u32,
+                })
+                .ok()
+                .and_then(|r| r.summary)
+                .and_then(|s| {
+                    if s.header.len() >= 72 {
+                        Some(u32::from_le_bytes([s.header[68], s.header[69], s.header[70], s.header[71]]))
+                    } else {
+                        None
+                    }
+                });
             return Ok(RpcGetAlkaneBlockTxsFullResult {
                 value: json!({
                     "ok": true,
                     "height": height,
+                    "block_time": block_time,
                     "page": page,
                     "limit": limit,
                     "total": 0,
@@ -5128,10 +5144,26 @@ impl EssentialsProvider {
         };
 
         if page_txids.is_empty() {
+            // Get block time for empty page
+            let block_time: Option<u32> = self
+                .get_block_summary(GetBlockSummaryParams {
+                    blockhash: StateAt::Latest,
+                    height: height as u32,
+                })
+                .ok()
+                .and_then(|r| r.summary)
+                .and_then(|s| {
+                    if s.header.len() >= 72 {
+                        Some(u32::from_le_bytes([s.header[68], s.header[69], s.header[70], s.header[71]]))
+                    } else {
+                        None
+                    }
+                });
             return Ok(RpcGetAlkaneBlockTxsFullResult {
                 value: json!({
                     "ok": true,
                     "height": height,
+                    "block_time": block_time,
                     "page": page,
                     "limit": limit,
                     "total": total_count,
@@ -5413,6 +5445,7 @@ impl EssentialsProvider {
             value: json!({
                 "ok": true,
                 "height": height,
+                "block_time": block_time,
                 "page": page,
                 "limit": limit,
                 "total": total_count,

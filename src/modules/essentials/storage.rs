@@ -5187,15 +5187,16 @@ impl EssentialsProvider {
         )
         .unwrap_or_default();
 
-        // Identify transfers without traces that need raw_tx_data for marketplace detection
+        // Identify transactions without traces that need raw_tx_data for marketplace detection
         // and collect their previous transaction txids for prevout value lookup
         let mut needs_raw_tx_data: HashSet<Txid> = HashSet::new();
         let mut prev_txids_to_fetch: HashSet<Txid> = HashSet::new();
         
         for txid in &page_txids {
             if let Some(summary) = load_tx_summary_v2(self, txid) {
-                // Include raw_tx_data for transfers without traces (potential marketplace transactions)
-                if summary.tx_type == TxType::Transfer && summary.traces.is_empty() {
+                // Include raw_tx_data for any transaction without traces (for SIGHASH_SINGLE detection)
+                // This covers transfers, marketplace, and unknown tx types
+                if summary.traces.is_empty() {
                     needs_raw_tx_data.insert(*txid);
                     
                     // Collect previous txids for this transaction

@@ -3169,6 +3169,285 @@ impl EssentialsProvider {
         })
     }
 
+    /// Get full mempool alkane transactions with balance_changes (similar to get_alkane_block_txs_full)
+    pub fn rpc_get_mempool_alkane_txs_full(
+        &self,
+        params: RpcGetMempoolAlkaneTxsFullParams,
+    ) -> Result<RpcGetMempoolAlkaneTxsFullResult> {
+        let page = params.page.unwrap_or(1).max(1) as usize;
+        let limit = params.limit.unwrap_or(50).max(1).min(100) as usize;
+        let hide_diesel = params.hide_diesel_mints.unwrap_or(false);
+        let off = limit.saturating_mul(page.saturating_sub(1));
+
+        // Get all mempool entries with alkane traces
+        let seen_page = self
+            .get_mempool_seen_page(GetMempoolSeenPageParams {
+                blockhash: StateAt::Latest,
+                page: 1,
+                limit: 10000, // Get all to filter
+            })
+            .unwrap_or(GetMempoolSeenPageResult { txids: Vec::new(), has_more: false });
+
+        // Collect entries with traces (alkane transactions)
+        let mut alkane_entries: Vec<MempoolEntry> = Vec::new();
+        for txid in seen_page.txids {
+            let entry = self
+                .get_mempool_entry(GetMempoolEntryParams { blockhash: StateAt::Latest, txid })
+                .ok()
+                .and_then(|resp| resp.entry);
+            let Some(entry) = entry else { continue };
+            
+            // Filter: only keep transactions with traces (alkane transactions)
+            if entry.traces.as_ref().map_or(true, |t| t.is_empty()) {
+                continue;
+            }
+            
+            // Filter: hide diesel mints if requested
+            if hide_diesel {
+                let is_diesel = entry.traces.as_ref().map_or(false, |traces| {
+                    traces.len() == 1 && traces.get(0).map_or(false, |t| {
+                        is_diesel_mint_trace_sandshrew(&t.sandshrew_trace)
+                    })
+                });
+                if is_diesel {
+                    continue;
+                }
+            }
+            
+            alkane_entries.push(entry);
+        }
+
+        let total = alkane_entries.len();
+        let has_more = total > off + limit;
+
+        // Paginate
+        let page_entries: Vec<MempoolEntry> = alkane_entries
+            .into_iter()
+            .skip(off)
+            .take(limit)
+            .collect();
+
+        if page_entries.is_empty() {
+            return Ok(RpcGetMempoolAlkaneTxsFullResult {
+                value: json!({
+                    "ok": true,
+                    "page": page,
+                    "limit": limit,
+                    "total": total,
+                    "has_more": has_more,
+                    "transactions": []
+                }),
+            });
+        }
+
+        // Collect all outpoints we need balances for
+        let mut all_outpoints: Vec<(Txid, u32)> = Vec::new();
+        for entry in &page_entries {
+            // Collect input outpoints
+            for vin in &entry.tx.input {
+                if !vin.previous_output.is_null() {
+                    all_outpoints.push((vin.previous_output.txid, vin.previous_output.vout));
+                }
+            }
+            // Collect output outpoints
+            for vout in 0..entry.tx.output.len() {
+                all_outpoints.push((entry.txid, vout as u32));
+            }
+        }
+
+        // Deduplicate outpoints
+        all_outpoints.sort();
+        all_outpoints.dedup();
+
+        // Batch fetch balance data for all outpoints
+        let outpoint_balances = get_outpoint_balances_with_spent_batch(
+            StateAt::Latest,
+            self,
+            &all_outpoints,
+        )
+        .unwrap_or_default();
+
+        // Collect previous txids for raw_tx_data
+        let electrum_like = get_electrum_like();
+        let mut prev_txids_to_fetch: HashSet<Txid> = HashSet::new();
+        for entry in &page_entries {
+            for vin in &entry.tx.input {
+                if !vin.previous_output.is_null() {
+                    prev_txids_to_fetch.insert(vin.previous_output.txid);
+                }
+            }
+        }
+
+        // Batch fetch previous transactions
+        let prev_txs: HashMap<Txid, Transaction> = if !prev_txids_to_fetch.is_empty() {
+            let prev_txid_vec: Vec<Txid> = prev_txids_to_fetch.into_iter().collect();
+            let prev_raw_txs = electrum_like
+                .batch_transaction_get_raw(&prev_txid_vec)
+                .unwrap_or_default();
+            prev_txid_vec.iter().enumerate()
+                .filter_map(|(idx, txid)| {
+                    prev_raw_txs.get(idx)
+                        .and_then(|raw| deserialize::<Transaction>(raw).ok())
+                        .map(|tx| (*txid, tx))
+                })
+                .collect()
+        } else {
+            HashMap::new()
+        };
+
+        let network = get_network();
+
+        // Helper to convert balances to JSON
+        let balances_to_json = |balances: &[BalanceEntry]| -> Vec<Value> {
+            balances
+                .iter()
+                .map(|b| {
+                    json!({
+                        "alkane": format!("{}:{}", b.alkane.block, b.alkane.tx),
+                        "amount": b.amount.to_string(),
+                    })
+                })
+                .collect()
+        };
+
+        // Build transaction JSON
+        let mut transactions: Vec<Value> = Vec::new();
+        for entry in &page_entries {
+            let txid = entry.txid;
+            let tx = &entry.tx;
+
+            // Determine tx_type from traces
+            let tx_type = if let Some(traces) = entry.traces.as_ref() {
+                if traces.len() == 1 && is_diesel_mint_trace_sandshrew(&traces[0].sandshrew_trace) {
+                    "diesel_mint"
+                } else if !traces.is_empty() {
+                    "contract_call"
+                } else {
+                    "transfer"
+                }
+            } else {
+                "transfer"
+            };
+
+            // Build traces JSON
+            let traces_json: Vec<Value> = entry.traces.as_ref().map_or(Vec::new(), |traces| {
+                traces.iter().map(|t| {
+                    let events_val = prettyify_protobuf_trace_json(&t.protobuf_trace)
+                        .ok()
+                        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+                        .unwrap_or(Value::Null);
+                    json!({
+                        "outpoint": format!("{}:{}", txid, t.outpoint.vout),
+                        "events": events_val,
+                    })
+                }).collect()
+            });
+
+            // Build balance_changes
+            let mut inputs_json: Vec<Value> = Vec::new();
+            for (vin_idx, vin) in tx.input.iter().enumerate() {
+                if vin.previous_output.is_null() {
+                    continue;
+                }
+                let outpoint_key = (vin.previous_output.txid, vin.previous_output.vout);
+                if let Some(lookup) = outpoint_balances.get(&outpoint_key) {
+                    if !lookup.balances.is_empty() {
+                        inputs_json.push(json!({
+                            "vin": vin_idx,
+                            "outpoint": format!("{}:{}", vin.previous_output.txid, vin.previous_output.vout),
+                            "address": lookup.address,
+                            "balances": balances_to_json(&lookup.balances),
+                        }));
+                    }
+                }
+            }
+
+            let mut outputs_json: Vec<Value> = Vec::new();
+            for vout in 0..tx.output.len() {
+                let outpoint_key = (txid, vout as u32);
+                if let Some(lookup) = outpoint_balances.get(&outpoint_key) {
+                    if !lookup.balances.is_empty() {
+                        outputs_json.push(json!({
+                            "vout": vout,
+                            "outpoint": format!("{}:{}", txid, vout),
+                            "address": lookup.address,
+                            "balances": balances_to_json(&lookup.balances),
+                        }));
+                    }
+                }
+            }
+
+            let balance_changes_json = if inputs_json.is_empty() && outputs_json.is_empty() {
+                Value::Null
+            } else {
+                json!({
+                    "inputs": inputs_json,
+                    "outputs": outputs_json,
+                })
+            };
+
+            // Build raw_tx_data (for marketplace detection via SIGHASH_SINGLE)
+            let vin_json: Vec<Value> = tx.input.iter().map(|vin| {
+                let mut obj = json!({
+                    "txid": vin.previous_output.txid.to_string(),
+                    "vout": vin.previous_output.vout,
+                });
+                
+                if !vin.witness.is_empty() {
+                    obj["witness"] = json!(vin.witness.iter()
+                        .map(|w| hex::encode(w))
+                        .collect::<Vec<_>>());
+                }
+                
+                if let Some(prev_tx) = prev_txs.get(&vin.previous_output.txid) {
+                    if let Some(prev_out) = prev_tx.output.get(vin.previous_output.vout as usize) {
+                        obj["prevout_value"] = json!(prev_out.value.to_sat());
+                        if let Ok(addr) = Address::from_script(prev_out.script_pubkey.as_script(), network) {
+                            obj["prevout_address"] = json!(addr.to_string());
+                        }
+                    }
+                }
+                
+                obj
+            }).collect();
+            
+            let vout_json: Vec<Value> = tx.output.iter().map(|out| {
+                let mut obj = json!({
+                    "value": out.value.to_sat(),
+                });
+                if let Ok(addr) = Address::from_script(out.script_pubkey.as_script(), network) {
+                    obj["address"] = json!(addr.to_string());
+                }
+                obj
+            }).collect();
+
+            let raw_tx_data_json = json!({
+                "vin": vin_json,
+                "vout": vout_json,
+            });
+
+            transactions.push(json!({
+                "txid": txid.to_string(),
+                "first_seen": entry.first_seen,
+                "tx_type": tx_type,
+                "traces": traces_json,
+                "balance_changes": balance_changes_json,
+                "raw_tx_data": raw_tx_data_json,
+            }));
+        }
+
+        Ok(RpcGetMempoolAlkaneTxsFullResult {
+            value: json!({
+                "ok": true,
+                "page": page,
+                "limit": limit,
+                "total": total,
+                "has_more": has_more,
+                "transactions": transactions
+            }),
+        })
+    }
+
     pub fn rpc_get_keys(&self, params: RpcGetKeysParams) -> Result<RpcGetKeysResult> {
         let Some(alk_raw) = params.alkane.as_deref() else {
             return Ok(RpcGetKeysResult {
@@ -6422,6 +6701,16 @@ pub struct RpcGetMempoolTracesParams {
 }
 
 pub struct RpcGetMempoolTracesResult {
+    pub value: Value,
+}
+
+pub struct RpcGetMempoolAlkaneTxsFullParams {
+    pub page: Option<u64>,
+    pub limit: Option<u64>,
+    pub hide_diesel_mints: Option<bool>,
+}
+
+pub struct RpcGetMempoolAlkaneTxsFullResult {
     pub value: Value,
 }
 

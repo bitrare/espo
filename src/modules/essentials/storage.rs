@@ -30,7 +30,8 @@ use protorune_support::protostone::Protostone;
 use serde_json::{Value, json, map::Map};
 
 use crate::runtime::mempool::{
-    MempoolEntry, get_seen_txids_page, get_tx_from_mempool, pending_by_txid, pending_for_address,
+    MempoolEntry, get_seen_txids_page, get_tx_from_mempool, pending_action_entries,
+    pending_by_txid, pending_for_address,
 };
 use crate::utils::electrum_like::{AddressHistoryEntry, AddressUtxo, ElectrumLikeBackend};
 pub use crate::utils::fee_rates::{BlockFeeRateSummary, compute_block_fee_rate_summary};
@@ -3179,24 +3180,13 @@ impl EssentialsProvider {
         let hide_diesel = params.hide_diesel_mints.unwrap_or(false);
         let off = limit.saturating_mul(page.saturating_sub(1));
 
-        // Get all mempool entries with alkane traces
-        let seen_page = self
-            .get_mempool_seen_page(GetMempoolSeenPageParams {
-                blockhash: StateAt::Latest,
-                page: 1,
-                limit: 10000, // Get all to filter
-            })
-            .unwrap_or(GetMempoolSeenPageResult { txids: Vec::new(), has_more: false });
-
-        // Collect entries with traces (alkane transactions)
+        // Get all mempool entries with alkane/rune actions using pending_action_entries
+        // This returns ALL alkane transactions in the mempool directly (much more efficient)
+        let all_action_entries = pending_action_entries();
+        
+        // Collect and filter entries
         let mut alkane_entries: Vec<MempoolEntry> = Vec::new();
-        for txid in seen_page.txids {
-            let entry = self
-                .get_mempool_entry(GetMempoolEntryParams { blockhash: StateAt::Latest, txid })
-                .ok()
-                .and_then(|resp| resp.entry);
-            let Some(entry) = entry else { continue };
-            
+        for entry in all_action_entries {
             // Filter: only keep transactions with traces (alkane transactions)
             if entry.traces.as_ref().map_or(true, |t| t.is_empty()) {
                 continue;

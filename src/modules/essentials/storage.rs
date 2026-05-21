@@ -5145,8 +5145,13 @@ impl EssentialsProvider {
             };
             (page_slice, filtered_total)
         };
-        eprintln!("[rpc_get_alkane_block_txs_full] height={} collect_txids took {}ms (raw_total={}, page_txids={}, total_count={})", 
-            height, step_start.elapsed().as_millis(), raw_total, page_txids.len(), total_count);
+        // Only log for large pages (> 20 txs) or slow operations (> 200ms)
+        let should_log_rpc = page_txids.len() > 20;
+        let step_ms = step_start.elapsed().as_millis();
+        if should_log_rpc || step_ms > 200 {
+            eprintln!("[rpc_get_alkane_block_txs_full] height={} collect_txids took {}ms (raw_total={}, page_txids={}, total_count={})", 
+                height, step_ms, raw_total, page_txids.len(), total_count);
+        }
 
         if page_txids.is_empty() {
             // Get block time for empty page
@@ -5183,8 +5188,11 @@ impl EssentialsProvider {
         let raw_txs = electrum_like
             .batch_transaction_get_raw(&page_txids)
             .unwrap_or_default();
-        eprintln!("[rpc_get_alkane_block_txs_full] height={} batch_tx_get_raw took {}ms for {} txids", 
-            height, step_start.elapsed().as_millis(), page_txids.len());
+        let step_ms = step_start.elapsed().as_millis();
+        if should_log_rpc || step_ms > 200 {
+            eprintln!("[rpc_get_alkane_block_txs_full] height={} batch_tx_get_raw took {}ms for {} txids", 
+                height, step_ms, page_txids.len());
+        }
 
         // Decode transactions and collect all outpoints we need balances for
         let mut decoded_txs: HashMap<Txid, Transaction> = HashMap::new();
@@ -5218,7 +5226,9 @@ impl EssentialsProvider {
         // Deduplicate outpoints
         all_outpoints.sort();
         all_outpoints.dedup();
-        eprintln!("[rpc_get_alkane_block_txs_full] height={} collected {} unique outpoints", height, all_outpoints.len());
+        if should_log_rpc {
+            eprintln!("[rpc_get_alkane_block_txs_full] height={} collected {} unique outpoints", height, all_outpoints.len());
+        }
 
         // Batch fetch balance data for all outpoints
         let step_start = std::time::Instant::now();
@@ -5228,8 +5238,11 @@ impl EssentialsProvider {
             &all_outpoints,
         )
         .unwrap_or_default();
-        eprintln!("[rpc_get_alkane_block_txs_full] height={} outpoint_balances_batch took {}ms", 
-            height, step_start.elapsed().as_millis());
+        let step_ms = step_start.elapsed().as_millis();
+        if should_log_rpc || step_ms > 200 {
+            eprintln!("[rpc_get_alkane_block_txs_full] height={} outpoint_balances_batch took {}ms", 
+                height, step_ms);
+        }
 
         // Identify transactions without traces that need raw_tx_data for marketplace detection
         // and collect their previous transaction txids for prevout value lookup
@@ -5259,8 +5272,10 @@ impl EssentialsProvider {
         let step_start = std::time::Instant::now();
         let prev_txs: HashMap<Txid, Transaction> = if !prev_txids_to_fetch.is_empty() {
             let prev_txid_vec: Vec<Txid> = prev_txids_to_fetch.into_iter().collect();
-            eprintln!("[rpc_get_alkane_block_txs_full] height={} fetching {} prev txs for raw_tx_data", 
-                height, prev_txid_vec.len());
+            if should_log_rpc {
+                eprintln!("[rpc_get_alkane_block_txs_full] height={} fetching {} prev txs for raw_tx_data", 
+                    height, prev_txid_vec.len());
+            }
             let prev_raw_txs = electrum_like
                 .batch_transaction_get_raw(&prev_txid_vec)
                 .unwrap_or_default();
@@ -5275,8 +5290,11 @@ impl EssentialsProvider {
         } else {
             HashMap::new()
         };
-        eprintln!("[rpc_get_alkane_block_txs_full] height={} prev_txs_batch took {}ms", 
-            height, step_start.elapsed().as_millis());
+        let step_ms = step_start.elapsed().as_millis();
+        if should_log_rpc || step_ms > 200 {
+            eprintln!("[rpc_get_alkane_block_txs_full] height={} prev_txs_batch took {}ms", 
+                height, step_ms);
+        }
 
         // Get block time from block summary
         let block_time: Option<u32> = self
@@ -5459,10 +5477,16 @@ impl EssentialsProvider {
             }));
         }
 
-        eprintln!("[rpc_get_alkane_block_txs_full] height={} build_json_loop took {}ms for {} txs", 
-            height, step_start.elapsed().as_millis(), transactions.len());
-        eprintln!("[rpc_get_alkane_block_txs_full] height={} TOTAL took {}ms, returning {} transactions", 
-            height, total_start.elapsed().as_millis(), transactions.len());
+        let step_ms = step_start.elapsed().as_millis();
+        if should_log_rpc || step_ms > 200 {
+            eprintln!("[rpc_get_alkane_block_txs_full] height={} build_json_loop took {}ms for {} txs", 
+                height, step_ms, transactions.len());
+        }
+        let total_ms = total_start.elapsed().as_millis();
+        if should_log_rpc || total_ms > 500 {
+            eprintln!("[rpc_get_alkane_block_txs_full] height={} TOTAL took {}ms, returning {} transactions", 
+                height, total_ms, transactions.len());
+        }
 
         Ok(RpcGetAlkaneBlockTxsFullResult {
             value: json!({
@@ -7328,6 +7352,8 @@ pub(crate) fn resolve_outpoint_ids_batch_v2(
 ) -> Result<Vec<Option<u64>>> {
     let total_start = std::time::Instant::now();
     let outpoints_count = outpoints.len();
+    // Only log for large batches (> 10) or slow operations (> 200ms)
+    let should_log = outpoints_count > 10;
     
     if outpoints.is_empty() {
         return Ok(Vec::new());
@@ -7340,16 +7366,22 @@ pub(crate) fn resolve_outpoint_ids_batch_v2(
         .iter()
         .map(|(txid, vout)| table.outpoint_pos_point_key_from_parts(txid.as_byte_array(), *vout))
         .collect::<Result<Vec<_>>>()?;
-    eprintln!("[resolve_outpoint_ids_batch_v2] build_keys took {}ms for {} outpoints", 
-        step_start.elapsed().as_millis(), outpoints_count);
+    let step_ms = step_start.elapsed().as_millis();
+    if should_log || step_ms > 200 {
+        eprintln!("[resolve_outpoint_ids_batch_v2] build_keys took {}ms for {} outpoints", 
+            step_ms, outpoints_count);
+    }
     
     // Step 2: Batch fetch
     let step_start = std::time::Instant::now();
     let raws = provider
         .get_blob_multi_values(GetMultiValuesParams { blockhash: StateAt::Latest, keys })?
         .values;
-    eprintln!("[resolve_outpoint_ids_batch_v2] get_blob_multi_values took {}ms for {} keys", 
-        step_start.elapsed().as_millis(), outpoints_count);
+    let step_ms = step_start.elapsed().as_millis();
+    if should_log || step_ms > 200 {
+        eprintln!("[resolve_outpoint_ids_batch_v2] get_blob_multi_values took {}ms for {} keys", 
+            step_ms, outpoints_count);
+    }
     
     let target = resolve_target_blockhash(provider, blockhash);
     let active_tip = provider
@@ -7408,11 +7440,17 @@ pub(crate) fn resolve_outpoint_ids_batch_v2(
             out.push(result);
         }
     }
-    eprintln!("[resolve_outpoint_ids_batch_v2] process_results took {}ms ({} blockhash_for_height lookups, {} slow >200ms)", 
-        step_start.elapsed().as_millis(), blockhash_lookups, slow_lookups);
+    let step_ms = step_start.elapsed().as_millis();
+    if should_log || step_ms > 200 || slow_lookups > 0 {
+        eprintln!("[resolve_outpoint_ids_batch_v2] process_results took {}ms ({} blockhash_for_height lookups, {} slow >200ms)", 
+            step_ms, blockhash_lookups, slow_lookups);
+    }
     
-    eprintln!("[resolve_outpoint_ids_batch_v2] TOTAL took {}ms for {} outpoints", 
-        total_start.elapsed().as_millis(), outpoints_count);
+    let total_ms = total_start.elapsed().as_millis();
+    if should_log || total_ms > 200 {
+        eprintln!("[resolve_outpoint_ids_batch_v2] TOTAL took {}ms for {} outpoints", 
+            total_ms, outpoints_count);
+    }
     
     Ok(out)
 }
@@ -7424,6 +7462,8 @@ pub(crate) fn resolve_outpoint_spent_by_ids_batch_v2(
 ) -> Result<Vec<Option<[u8; 32]>>> {
     let total_start = std::time::Instant::now();
     let ids_count = outpoint_ids.len();
+    // Only log for large batches (> 10) or slow operations (> 200ms)
+    let should_log = ids_count > 10;
     
     if outpoint_ids.is_empty() {
         return Ok(Vec::new());
@@ -7438,8 +7478,11 @@ pub(crate) fn resolve_outpoint_spent_by_ids_batch_v2(
     let raws = provider
         .get_blob_multi_values(GetMultiValuesParams { blockhash: StateAt::Latest, keys })?
         .values;
-    eprintln!("[resolve_outpoint_spent_by_ids_batch_v2] get_blob_multi_values took {}ms for {} IDs", 
-        step_start.elapsed().as_millis(), ids_count);
+    let step_ms = step_start.elapsed().as_millis();
+    if should_log || step_ms > 200 {
+        eprintln!("[resolve_outpoint_spent_by_ids_batch_v2] get_blob_multi_values took {}ms for {} IDs", 
+            step_ms, ids_count);
+    }
     
     let target = resolve_target_blockhash(provider, blockhash);
     let active_tip = provider
@@ -7495,11 +7538,17 @@ pub(crate) fn resolve_outpoint_spent_by_ids_batch_v2(
             out.push(result);
         }
     }
-    eprintln!("[resolve_outpoint_spent_by_ids_batch_v2] process_results took {}ms ({} blockhash_for_height lookups, {} slow >200ms)", 
-        step_start.elapsed().as_millis(), blockhash_lookups, slow_lookups);
+    let step_ms = step_start.elapsed().as_millis();
+    if should_log || step_ms > 200 || slow_lookups > 0 {
+        eprintln!("[resolve_outpoint_spent_by_ids_batch_v2] process_results took {}ms ({} blockhash_for_height lookups, {} slow >200ms)", 
+            step_ms, blockhash_lookups, slow_lookups);
+    }
     
-    eprintln!("[resolve_outpoint_spent_by_ids_batch_v2] TOTAL took {}ms for {} IDs", 
-        total_start.elapsed().as_millis(), ids_count);
+    let total_ms = total_start.elapsed().as_millis();
+    if should_log || total_ms > 200 {
+        eprintln!("[resolve_outpoint_spent_by_ids_batch_v2] TOTAL took {}ms for {} IDs", 
+            total_ms, ids_count);
+    }
     
     Ok(out)
 }

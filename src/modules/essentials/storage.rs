@@ -7054,6 +7054,32 @@ fn version_visible_for_target(
         .unwrap_or(false)
 }
 
+/// Cached version of version_visible_for_target that uses an external cache
+/// to avoid repeated blockhash_is_ancestor calls for the same blockhash
+fn version_visible_for_target_cached(
+    provider: &EssentialsProvider,
+    target: Option<BlockHash>,
+    version_blockhash: BlockHash,
+    ancestry_cache: &mut HashMap<BlockHash, bool>,
+) -> bool {
+    let Some(target_blockhash) = target else {
+        return true;
+    };
+    if version_blockhash == target_blockhash {
+        return true;
+    }
+    // Check cache first
+    if let Some(&cached) = ancestry_cache.get(&version_blockhash) {
+        return cached;
+    }
+    // Expensive call - cache the result
+    let result = provider
+        .blockhash_is_ancestor(&version_blockhash, &target_blockhash)
+        .unwrap_or(false);
+    ancestry_cache.insert(version_blockhash, result);
+    result
+}
+
 fn resolve_visible_u64_entry(
     provider: &EssentialsProvider,
     entries: &[VersionedU64EntryV1],
@@ -7084,6 +7110,38 @@ fn resolve_visible_u64_entry(
     None
 }
 
+/// Cached version that accepts an external ancestry cache to avoid repeated
+/// blockhash_is_ancestor calls across multiple outpoints in the same batch
+fn resolve_visible_u64_entry_with_cache(
+    provider: &EssentialsProvider,
+    entries: &[VersionedU64EntryV1],
+    target: Option<BlockHash>,
+    ancestry_cache: &mut HashMap<BlockHash, bool>,
+) -> Option<u64> {
+    let fast_active_tip = provider
+        .resolved_view_blockhash()
+        .filter(|_| provider.view_blockhash().is_none());
+    for entry in entries {
+        let entry_blockhash = BlockHash::from_byte_array(entry.blockhash);
+        if let (Some(target_blockhash), Some(active_tip)) = (target, fast_active_tip) {
+            if target_blockhash == active_tip {
+                let visible =
+                    *ancestry_cache.entry(entry_blockhash).or_insert_with(|| {
+                        provider.blockhash_is_on_active_chain(&entry_blockhash).unwrap_or(false)
+                    });
+                if visible {
+                    return Some(entry.value);
+                }
+                continue;
+            }
+        }
+        if version_visible_for_target_cached(provider, target, entry_blockhash, ancestry_cache) {
+            return Some(entry.value);
+        }
+    }
+    None
+}
+
 fn resolve_visible_bytes32_entry(
     provider: &EssentialsProvider,
     entries: &[VersionedBytes32EntryV1],
@@ -7108,6 +7166,38 @@ fn resolve_visible_bytes32_entry(
             }
         }
         if version_visible_for_target(provider, target, entry_blockhash) {
+            return Some(entry.value);
+        }
+    }
+    None
+}
+
+/// Cached version that accepts an external ancestry cache to avoid repeated
+/// blockhash_is_ancestor calls across multiple outpoints in the same batch
+fn resolve_visible_bytes32_entry_with_cache(
+    provider: &EssentialsProvider,
+    entries: &[VersionedBytes32EntryV1],
+    target: Option<BlockHash>,
+    ancestry_cache: &mut HashMap<BlockHash, bool>,
+) -> Option<[u8; 32]> {
+    let fast_active_tip = provider
+        .resolved_view_blockhash()
+        .filter(|_| provider.view_blockhash().is_none());
+    for entry in entries {
+        let entry_blockhash = BlockHash::from_byte_array(entry.blockhash);
+        if let (Some(target_blockhash), Some(active_tip)) = (target, fast_active_tip) {
+            if target_blockhash == active_tip {
+                let visible =
+                    *ancestry_cache.entry(entry_blockhash).or_insert_with(|| {
+                        provider.blockhash_is_on_active_chain(&entry_blockhash).unwrap_or(false)
+                    });
+                if visible {
+                    return Some(entry.value);
+                }
+                continue;
+            }
+        }
+        if version_visible_for_target_cached(provider, target, entry_blockhash, ancestry_cache) {
             return Some(entry.value);
         }
     }
@@ -7394,6 +7484,8 @@ pub(crate) fn resolve_outpoint_ids_batch_v2(
     let mut blockhash_lookups = 0usize;
     let mut slow_lookups = 0usize;
     let mut active_blockhash_by_height: HashMap<u32, Option<BlockHash>> = HashMap::new();
+    // Shared ancestry cache for the slow path - avoids repeated blockhash_is_ancestor calls
+    let mut ancestry_cache: HashMap<BlockHash, bool> = HashMap::new();
     let mut out = Vec::with_capacity(outpoints.len());
     for (idx, raw) in raws.into_iter().enumerate() {
         let Some(raw) = raw else {
@@ -7428,17 +7520,14 @@ pub(crate) fn resolve_outpoint_ids_batch_v2(
             }
             out.push(chosen);
         } else {
-            let resolve_start = std::time::Instant::now();
-            let result = resolve_visible_u64_entry(provider, &entries, target);
-            let resolve_ms = resolve_start.elapsed().as_millis();
-            if resolve_ms > 200 {
-                slow_lookups += 1;
-                let (txid, vout) = &outpoints[idx];
-                eprintln!("[resolve_outpoint_ids_batch_v2] SLOW resolve_visible_u64_entry: {}ms for outpoint {}:{}", 
-                    resolve_ms, txid, vout);
-            }
+            // Use cached version to share ancestry lookups across all outpoints in the batch
+            let result = resolve_visible_u64_entry_with_cache(provider, &entries, target, &mut ancestry_cache);
             out.push(result);
         }
+    }
+    // Log ancestry cache stats for debugging
+    if should_log && !ancestry_cache.is_empty() {
+        eprintln!("[resolve_outpoint_ids_batch_v2] ancestry_cache had {} unique blockhashes", ancestry_cache.len());
     }
     let step_ms = step_start.elapsed().as_millis();
     if should_log || step_ms > 200 || slow_lookups > 0 {
@@ -7494,6 +7583,8 @@ pub(crate) fn resolve_outpoint_spent_by_ids_batch_v2(
     let mut blockhash_lookups = 0usize;
     let mut slow_lookups = 0usize;
     let mut active_blockhash_by_height: HashMap<u32, Option<BlockHash>> = HashMap::new();
+    // Shared ancestry cache for the slow path - avoids repeated blockhash_is_ancestor calls
+    let mut ancestry_cache: HashMap<BlockHash, bool> = HashMap::new();
     let mut out = Vec::with_capacity(outpoint_ids.len());
     for (idx, raw) in raws.into_iter().enumerate() {
         let Some(raw) = raw else {
@@ -7527,16 +7618,14 @@ pub(crate) fn resolve_outpoint_spent_by_ids_batch_v2(
             }
             out.push(chosen);
         } else {
-            let resolve_start = std::time::Instant::now();
-            let result = resolve_visible_bytes32_entry(provider, &entries, target);
-            let resolve_ms = resolve_start.elapsed().as_millis();
-            if resolve_ms > 200 {
-                slow_lookups += 1;
-                eprintln!("[resolve_outpoint_spent_by_ids_batch_v2] SLOW resolve_visible_bytes32_entry: {}ms for ID {}", 
-                    resolve_ms, outpoint_ids[idx]);
-            }
+            // Use cached version to share ancestry lookups across all IDs in the batch
+            let result = resolve_visible_bytes32_entry_with_cache(provider, &entries, target, &mut ancestry_cache);
             out.push(result);
         }
+    }
+    // Log ancestry cache stats for debugging
+    if should_log && !ancestry_cache.is_empty() {
+        eprintln!("[resolve_outpoint_spent_by_ids_batch_v2] ancestry_cache had {} unique blockhashes", ancestry_cache.len());
     }
     let step_ms = step_start.elapsed().as_millis();
     if should_log || step_ms > 200 || slow_lookups > 0 {

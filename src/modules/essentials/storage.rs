@@ -30,8 +30,8 @@ use protorune_support::protostone::Protostone;
 use serde_json::{Value, json, map::Map};
 
 use crate::runtime::mempool::{
-    MempoolEntry, get_seen_txids_page, get_tx_from_mempool, pending_action_entries,
-    pending_by_txid, pending_for_address,
+    MempoolEntry, get_seen_txids_page, get_tx_from_mempool,
+    pending_action_entries_with_fee, pending_by_txid, pending_for_address,
 };
 use crate::utils::electrum_like::{AddressHistoryEntry, AddressUtxo, ElectrumLikeBackend};
 pub use crate::utils::fee_rates::{BlockFeeRateSummary, compute_block_fee_rate_summary};
@@ -3178,15 +3178,15 @@ impl EssentialsProvider {
         let page = params.page.unwrap_or(1).max(1) as usize;
         let limit = params.limit.unwrap_or(50).max(1).min(100) as usize;
         let hide_diesel = params.hide_diesel_mints.unwrap_or(false);
+        let next_block_only = params.next_block_only.unwrap_or(false);
         let off = limit.saturating_mul(page.saturating_sub(1));
 
-        // Get all mempool entries with alkane/rune actions using pending_action_entries
-        // This returns ALL alkane transactions in the mempool directly (much more efficient)
-        let all_action_entries = pending_action_entries();
+        // Get all mempool entries with alkane/rune actions and fee data
+        let all_action_entries = pending_action_entries_with_fee();
         
-        // Collect and filter entries
-        let mut alkane_entries: Vec<MempoolEntry> = Vec::new();
-        for entry in all_action_entries {
+        // Collect and filter entries (entry, fee_rate, fee_sat, vsize)
+        let mut alkane_entries: Vec<(MempoolEntry, f64, u64, u64)> = Vec::new();
+        for (entry, fee_rate, fee_sat, vsize) in all_action_entries {
             // Filter: only keep transactions with traces (alkane transactions)
             if entry.traces.as_ref().map_or(true, |t| t.is_empty()) {
                 continue;
@@ -3204,14 +3204,21 @@ impl EssentialsProvider {
                 }
             }
             
-            alkane_entries.push(entry);
+            // Filter: only next block transactions if requested
+            if next_block_only {
+                if !entry.position.as_ref().map_or(false, |p| p.block == 0) {
+                    continue;
+                }
+            }
+            
+            alkane_entries.push((entry, fee_rate, fee_sat, vsize));
         }
 
         let total = alkane_entries.len();
         let has_more = total > off + limit;
 
         // Paginate
-        let page_entries: Vec<MempoolEntry> = alkane_entries
+        let page_entries: Vec<(MempoolEntry, f64, u64, u64)> = alkane_entries
             .into_iter()
             .skip(off)
             .take(limit)
@@ -3232,7 +3239,7 @@ impl EssentialsProvider {
 
         // Collect all outpoints we need balances for
         let mut all_outpoints: Vec<(Txid, u32)> = Vec::new();
-        for entry in &page_entries {
+        for (entry, _, _, _) in &page_entries {
             // Collect input outpoints
             for vin in &entry.tx.input {
                 if !vin.previous_output.is_null() {
@@ -3260,7 +3267,7 @@ impl EssentialsProvider {
         // Collect previous txids for raw_tx_data
         let electrum_like = get_electrum_like();
         let mut prev_txids_to_fetch: HashSet<Txid> = HashSet::new();
-        for entry in &page_entries {
+        for (entry, _, _, _) in &page_entries {
             for vin in &entry.tx.input {
                 if !vin.previous_output.is_null() {
                     prev_txids_to_fetch.insert(vin.previous_output.txid);
@@ -3302,7 +3309,7 @@ impl EssentialsProvider {
 
         // Build transaction JSON
         let mut transactions: Vec<Value> = Vec::new();
-        for entry in &page_entries {
+        for (entry, fee_rate, fee_sat, vsize) in &page_entries {
             let txid = entry.txid;
             let tx = &entry.tx;
 
@@ -3416,9 +3423,19 @@ impl EssentialsProvider {
                 "vout": vout_json,
             });
 
+            // Build position JSON
+            let position_json = entry.position.as_ref().map(|p| json!({
+                "block": p.block,
+                "vsize": p.vsize,
+            }));
+
             transactions.push(json!({
                 "txid": txid.to_string(),
                 "first_seen": entry.first_seen,
+                "fee_rate": fee_rate,
+                "fee_sat": fee_sat,
+                "vsize": vsize,
+                "position": position_json,
                 "tx_type": tx_type,
                 "traces": traces_json,
                 "balance_changes": balance_changes_json,
@@ -6698,6 +6715,7 @@ pub struct RpcGetMempoolAlkaneTxsFullParams {
     pub page: Option<u64>,
     pub limit: Option<u64>,
     pub hide_diesel_mints: Option<bool>,
+    pub next_block_only: Option<bool>,
 }
 
 pub struct RpcGetMempoolAlkaneTxsFullResult {

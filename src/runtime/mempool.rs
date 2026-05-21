@@ -3085,6 +3085,25 @@ pub fn pending_action_entries() -> Vec<MempoolEntry> {
     out
 }
 
+/// Returns alkane action entries with fee data (fee_rate, fee_sat, vsize)
+pub fn pending_action_entries_with_fee() -> Vec<(MempoolEntry, f64, u64, u64)> {
+    let Ok(state) = mempool_state().read() else {
+        return Vec::new();
+    };
+    let mut out: Vec<(MempoolEntry, f64, u64, u64)> = state
+        .txs
+        .values()
+        .filter(|entry| entry_has_alkane_action(entry) || entry_has_rune_action(entry))
+        .filter_map(|entry| {
+            mempool_entry_from_state(entry).map(|mem_entry| {
+                (mem_entry, entry.fee_rate, entry.fee_sat, entry.vsize)
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| b.0.first_seen.cmp(&a.0.first_seen).then_with(|| b.0.txid.cmp(&a.0.txid)));
+    out
+}
+
 pub fn pending_action_entries_for_address(
     addr: &str,
     network: Network,

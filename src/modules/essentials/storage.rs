@@ -5030,6 +5030,7 @@ impl EssentialsProvider {
         &self,
         params: RpcGetAlkaneBlockTxsFullParams,
     ) -> Result<RpcGetAlkaneBlockTxsFullResult> {
+        let total_start = std::time::Instant::now();
         let Some(height) = params.height else {
             return Ok(RpcGetAlkaneBlockTxsFullResult {
                 value: json!({"ok": false, "error": "missing_or_invalid_height"}),
@@ -5037,6 +5038,7 @@ impl EssentialsProvider {
         };
         let page = params.page.unwrap_or(1).max(1) as usize;
         let limit = params.limit.unwrap_or(50).max(1).min(100) as usize;
+        eprintln!("[rpc_get_alkane_block_txs_full] height={} page={} limit={}", height, page, limit);
         let off = limit.saturating_mul(page.saturating_sub(1));
         let hide_diesel = params.hide_diesel_mints.unwrap_or(false);
         let filter_tx_type = params.tx_type.as_deref().and_then(TxType::from_str);
@@ -5080,6 +5082,7 @@ impl EssentialsProvider {
         }
 
         // Collect txids for the page (with optional filtering)
+        let step_start = std::time::Instant::now();
         let (page_txids, total_count): (Vec<Txid>, usize) = if !needs_filtering {
             let end = (off + limit).min(raw_total);
             let ids = if end > off {
@@ -5142,6 +5145,8 @@ impl EssentialsProvider {
             };
             (page_slice, filtered_total)
         };
+        eprintln!("[rpc_get_alkane_block_txs_full] height={} collect_txids took {}ms (raw_total={}, page_txids={}, total_count={})", 
+            height, step_start.elapsed().as_millis(), raw_total, page_txids.len(), total_count);
 
         if page_txids.is_empty() {
             // Get block time for empty page
@@ -5173,10 +5178,13 @@ impl EssentialsProvider {
         }
 
         // Batch fetch raw transactions to get input/output outpoints
+        let step_start = std::time::Instant::now();
         let electrum_like = get_electrum_like();
         let raw_txs = electrum_like
             .batch_transaction_get_raw(&page_txids)
             .unwrap_or_default();
+        eprintln!("[rpc_get_alkane_block_txs_full] height={} batch_tx_get_raw took {}ms for {} txids", 
+            height, step_start.elapsed().as_millis(), page_txids.len());
 
         // Decode transactions and collect all outpoints we need balances for
         let mut decoded_txs: HashMap<Txid, Transaction> = HashMap::new();
@@ -5210,14 +5218,18 @@ impl EssentialsProvider {
         // Deduplicate outpoints
         all_outpoints.sort();
         all_outpoints.dedup();
+        eprintln!("[rpc_get_alkane_block_txs_full] height={} collected {} unique outpoints", height, all_outpoints.len());
 
         // Batch fetch balance data for all outpoints
+        let step_start = std::time::Instant::now();
         let outpoint_balances = get_outpoint_balances_with_spent_batch(
             StateAt::Latest,
             self,
             &all_outpoints,
         )
         .unwrap_or_default();
+        eprintln!("[rpc_get_alkane_block_txs_full] height={} outpoint_balances_batch took {}ms", 
+            height, step_start.elapsed().as_millis());
 
         // Identify transactions without traces that need raw_tx_data for marketplace detection
         // and collect their previous transaction txids for prevout value lookup
@@ -5244,8 +5256,11 @@ impl EssentialsProvider {
         }
 
         // Batch fetch previous transactions for prevout values (only if needed)
+        let step_start = std::time::Instant::now();
         let prev_txs: HashMap<Txid, Transaction> = if !prev_txids_to_fetch.is_empty() {
             let prev_txid_vec: Vec<Txid> = prev_txids_to_fetch.into_iter().collect();
+            eprintln!("[rpc_get_alkane_block_txs_full] height={} fetching {} prev txs for raw_tx_data", 
+                height, prev_txid_vec.len());
             let prev_raw_txs = electrum_like
                 .batch_transaction_get_raw(&prev_txid_vec)
                 .unwrap_or_default();
@@ -5260,6 +5275,8 @@ impl EssentialsProvider {
         } else {
             HashMap::new()
         };
+        eprintln!("[rpc_get_alkane_block_txs_full] height={} prev_txs_batch took {}ms", 
+            height, step_start.elapsed().as_millis());
 
         // Get block time from block summary
         let block_time: Option<u32> = self
@@ -5295,6 +5312,7 @@ impl EssentialsProvider {
         };
 
         // Build transaction JSON with balance_changes
+        let step_start = std::time::Instant::now();
         let mut transactions: Vec<Value> = Vec::new();
         for txid in &page_txids {
             let summary = match load_tx_summary_v2(self, txid) {
@@ -5440,6 +5458,11 @@ impl EssentialsProvider {
                 "raw_tx_data": raw_tx_data_json,
             }));
         }
+
+        eprintln!("[rpc_get_alkane_block_txs_full] height={} build_json_loop took {}ms for {} txs", 
+            height, step_start.elapsed().as_millis(), transactions.len());
+        eprintln!("[rpc_get_alkane_block_txs_full] height={} TOTAL took {}ms, returning {} transactions", 
+            height, total_start.elapsed().as_millis(), transactions.len());
 
         Ok(RpcGetAlkaneBlockTxsFullResult {
             value: json!({

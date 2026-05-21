@@ -6001,6 +6001,120 @@ impl EssentialsProvider {
             }),
         })
     }
+
+    /// Check if a list of outpoints are spent and return their spent status
+    pub fn rpc_check_outpoints_spent(
+        &self,
+        params: RpcCheckOutpointsSpentParams,
+    ) -> Result<RpcCheckOutpointsSpentResult> {
+        let Some(outpoints) = params.outpoints else {
+            return Ok(RpcCheckOutpointsSpentResult {
+                value: json!({"ok": false, "error": "missing_outpoints"}),
+            });
+        };
+
+        if outpoints.is_empty() {
+            return Ok(RpcCheckOutpointsSpentResult {
+                value: json!({"ok": true, "results": {}}),
+            });
+        }
+
+        let mut results: serde_json::Map<String, Value> = serde_json::Map::new();
+
+        for outpoint_str in outpoints {
+            // Parse outpoint string "txid:vout"
+            let parts: Vec<&str> = outpoint_str.split(':').collect();
+            if parts.len() != 2 {
+                results.insert(outpoint_str.clone(), json!({
+                    "error": "invalid_format",
+                    "spent": null
+                }));
+                continue;
+            }
+
+            let txid_hex = parts[0];
+            let vout: u32 = match parts[1].parse() {
+                Ok(v) => v,
+                Err(_) => {
+                    results.insert(outpoint_str.clone(), json!({
+                        "error": "invalid_vout",
+                        "spent": null
+                    }));
+                    continue;
+                }
+            };
+
+            // Parse txid from hex
+            let txid_bytes: [u8; 32] = match hex::decode(txid_hex) {
+                Ok(bytes) if bytes.len() == 32 => {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&bytes);
+                    // Reverse for internal representation (Bitcoin uses little-endian)
+                    arr.reverse();
+                    arr
+                }
+                _ => {
+                    results.insert(outpoint_str.clone(), json!({
+                        "error": "invalid_txid",
+                        "spent": null
+                    }));
+                    continue;
+                }
+            };
+
+            // Look up outpoint ID using the existing helper function
+            let outpoint_id = match resolve_outpoint_id_v2(self, StateAt::Latest, &txid_bytes, vout) {
+                Ok(Some(id)) => id,
+                Ok(None) => {
+                    results.insert(outpoint_str.clone(), json!({
+                        "error": "outpoint_not_found",
+                        "spent": null
+                    }));
+                    continue;
+                }
+                Err(_) => {
+                    results.insert(outpoint_str.clone(), json!({
+                        "error": "lookup_error",
+                        "spent": null
+                    }));
+                    continue;
+                }
+            };
+
+            // Check if spent using existing function
+            match resolve_outpoint_spent_by_id_v2(self, StateAt::Latest, outpoint_id) {
+                Ok(Some(spent_txid_bytes)) => {
+                    // Reverse back for display (Bitcoin display format)
+                    let mut display_txid = spent_txid_bytes;
+                    display_txid.reverse();
+                    let spent_txid_hex = hex::encode(display_txid);
+                    results.insert(outpoint_str.clone(), json!({
+                        "spent": true,
+                        "spent_by": spent_txid_hex
+                    }));
+                }
+                Ok(None) => {
+                    results.insert(outpoint_str.clone(), json!({
+                        "spent": false,
+                        "spent_by": null
+                    }));
+                }
+                Err(_) => {
+                    results.insert(outpoint_str.clone(), json!({
+                        "error": "spent_lookup_error",
+                        "spent": null
+                    }));
+                }
+            }
+        }
+
+        Ok(RpcCheckOutpointsSpentResult {
+            value: json!({
+                "ok": true,
+                "results": results
+            }),
+        })
+    }
 }
 
 pub struct GetRawValueParams {
@@ -6567,6 +6681,14 @@ pub struct RpcGetKnownMarketplacesResult {
 pub struct RpcGetTxTypesParams;
 
 pub struct RpcGetTxTypesResult {
+    pub value: Value,
+}
+
+pub struct RpcCheckOutpointsSpentParams {
+    pub outpoints: Option<Vec<String>>,
+}
+
+pub struct RpcCheckOutpointsSpentResult {
     pub value: Value,
 }
 

@@ -1,14 +1,15 @@
 use crate::modules::defs::RpcNsRegistrar;
 use crate::modules::essentials::storage::{
-    EssentialsProvider, RpcGetAddressActivityParams, RpcGetAddressBalancesParams,
-    RpcGetAddressOutpointsParams, RpcGetAddressSpendableOutpointsParams,
-    RpcGetAddressTransactionsParams, RpcGetAlkaneAddressTxsParams,
-    RpcGetAlkaneBalanceMetashrewParams, RpcGetAlkaneBalanceTxsByTokenParams,
-    RpcGetAlkaneBalanceTxsParams, RpcGetAlkaneBalancesParams, RpcGetAlkaneBlockTxsParams,
-    RpcGetAlkaneBlockTxsFullParams, RpcGetAlkaneInfoParams, RpcGetAlkaneLatestTracesParams,
-    RpcGetAlkaneTxSummaryParams, RpcGetAllAlkanesParams, RpcGetBlockSummaryParams,
-    RpcGetBlockTracesParams, RpcGetCirculatingSupplyParams, RpcGetHoldersCountParams,
-    RpcGetHoldersParams, RpcGetKeysParams, RpcGetKnownMarketplacesParams, RpcGetMempoolTracesParams,
+    EssentialsProvider, RpcCheckOutpointsSpentParams, RpcGetAddressActivityParams,
+    RpcGetAddressBalancesParams, RpcGetAddressOutpointsParams,
+    RpcGetAddressSpendableOutpointsParams, RpcGetAddressTransactionsParams,
+    RpcGetAlkaneAddressTxsParams, RpcGetAlkaneBalanceMetashrewParams,
+    RpcGetAlkaneBalanceTxsByTokenParams, RpcGetAlkaneBalanceTxsParams,
+    RpcGetAlkaneBalancesParams, RpcGetAlkaneBlockTxsParams, RpcGetAlkaneBlockTxsFullParams,
+    RpcGetAlkaneInfoParams, RpcGetAlkaneLatestTracesParams, RpcGetAlkaneTxSummaryParams,
+    RpcGetAllAlkanesParams, RpcGetBlockSummaryParams, RpcGetBlockTracesParams,
+    RpcGetCirculatingSupplyParams, RpcGetHoldersCountParams, RpcGetHoldersParams,
+    RpcGetKeysParams, RpcGetKnownMarketplacesParams, RpcGetMempoolTracesParams,
     RpcGetOutpointBalancesParams, RpcGetTotalReceivedParams, RpcGetTransferVolumeParams,
     RpcGetTxTypesParams, RpcPingParams,
 };
@@ -892,6 +893,37 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                             Err(err) => return err,
                         };
                         view.rpc_get_tx_types(RpcGetTxTypesParams)
+                            .map(|resp| resp.value)
+                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                    }
+                })
+                .await;
+        });
+    }
+
+    {
+        let reg_check_outpoints = reg.clone();
+        let mdb_check_outpoints = Arc::clone(&mdb);
+        tokio::spawn(async move {
+            reg_check_outpoints
+                .register("check_outpoints_spent", move |_cx, payload| {
+                    let mdb = Arc::clone(&mdb_check_outpoints);
+                    async move {
+                        let view = match resolve_view(mdb.as_ref(), &payload) {
+                            Ok(v) => v,
+                            Err(err) => return err,
+                        };
+                        let params = RpcCheckOutpointsSpentParams {
+                            outpoints: payload
+                                .get("outpoints")
+                                .and_then(|v| v.as_array())
+                                .map(|arr| {
+                                    arr.iter()
+                                        .filter_map(|v| v.as_str().map(String::from))
+                                        .collect()
+                                }),
+                        };
+                        view.rpc_check_outpoints_spent(params)
                             .map(|resp| resp.value)
                             .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
                     }

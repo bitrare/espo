@@ -7326,25 +7326,44 @@ pub(crate) fn resolve_outpoint_ids_batch_v2(
     blockhash: StateAt,
     outpoints: &[(Txid, u32)],
 ) -> Result<Vec<Option<u64>>> {
+    let total_start = std::time::Instant::now();
+    let outpoints_count = outpoints.len();
+    
     if outpoints.is_empty() {
         return Ok(Vec::new());
     }
     let table = provider.table();
+    
+    // Step 1: Build keys
+    let step_start = std::time::Instant::now();
     let keys: Vec<Vec<u8>> = outpoints
         .iter()
         .map(|(txid, vout)| table.outpoint_pos_point_key_from_parts(txid.as_byte_array(), *vout))
         .collect::<Result<Vec<_>>>()?;
+    eprintln!("[resolve_outpoint_ids_batch_v2] build_keys took {}ms for {} outpoints", 
+        step_start.elapsed().as_millis(), outpoints_count);
+    
+    // Step 2: Batch fetch
+    let step_start = std::time::Instant::now();
     let raws = provider
         .get_blob_multi_values(GetMultiValuesParams { blockhash: StateAt::Latest, keys })?
         .values;
+    eprintln!("[resolve_outpoint_ids_batch_v2] get_blob_multi_values took {}ms for {} keys", 
+        step_start.elapsed().as_millis(), outpoints_count);
+    
     let target = resolve_target_blockhash(provider, blockhash);
     let active_tip = provider
         .resolved_view_blockhash()
         .filter(|_| provider.view_blockhash().is_none());
     let fast_active = matches!(target, Some(t) if Some(t) == active_tip);
+    
+    // Step 3: Process results (this is where blockhash_for_height calls happen)
+    let step_start = std::time::Instant::now();
+    let mut blockhash_lookups = 0usize;
+    let mut slow_lookups = 0usize;
     let mut active_blockhash_by_height: HashMap<u32, Option<BlockHash>> = HashMap::new();
     let mut out = Vec::with_capacity(outpoints.len());
-    for raw in raws {
+    for (idx, raw) in raws.into_iter().enumerate() {
         let Some(raw) = raw else {
             out.push(None);
             continue;
@@ -7357,7 +7376,16 @@ pub(crate) fn resolve_outpoint_ids_batch_v2(
                     if let Some(cached) = active_blockhash_by_height.get(&entry.height) {
                         *cached
                     } else {
+                        blockhash_lookups += 1;
+                        let lookup_start = std::time::Instant::now();
                         let found = provider.blockhash_for_height(entry.height).unwrap_or(None);
+                        let lookup_ms = lookup_start.elapsed().as_millis();
+                        if lookup_ms > 200 {
+                            slow_lookups += 1;
+                            let (txid, vout) = &outpoints[idx];
+                            eprintln!("[resolve_outpoint_ids_batch_v2] SLOW blockhash_for_height({}): {}ms for outpoint {}:{}", 
+                                entry.height, lookup_ms, txid, vout);
+                        }
                         active_blockhash_by_height.insert(entry.height, found);
                         found
                     };
@@ -7368,9 +7396,24 @@ pub(crate) fn resolve_outpoint_ids_batch_v2(
             }
             out.push(chosen);
         } else {
-            out.push(resolve_visible_u64_entry(provider, &entries, target));
+            let resolve_start = std::time::Instant::now();
+            let result = resolve_visible_u64_entry(provider, &entries, target);
+            let resolve_ms = resolve_start.elapsed().as_millis();
+            if resolve_ms > 200 {
+                slow_lookups += 1;
+                let (txid, vout) = &outpoints[idx];
+                eprintln!("[resolve_outpoint_ids_batch_v2] SLOW resolve_visible_u64_entry: {}ms for outpoint {}:{}", 
+                    resolve_ms, txid, vout);
+            }
+            out.push(result);
         }
     }
+    eprintln!("[resolve_outpoint_ids_batch_v2] process_results took {}ms ({} blockhash_for_height lookups, {} slow >200ms)", 
+        step_start.elapsed().as_millis(), blockhash_lookups, slow_lookups);
+    
+    eprintln!("[resolve_outpoint_ids_batch_v2] TOTAL took {}ms for {} outpoints", 
+        total_start.elapsed().as_millis(), outpoints_count);
+    
     Ok(out)
 }
 
@@ -7379,6 +7422,9 @@ pub(crate) fn resolve_outpoint_spent_by_ids_batch_v2(
     blockhash: StateAt,
     outpoint_ids: &[u64],
 ) -> Result<Vec<Option<[u8; 32]>>> {
+    let total_start = std::time::Instant::now();
+    let ids_count = outpoint_ids.len();
+    
     if outpoint_ids.is_empty() {
         return Ok(Vec::new());
     }
@@ -7387,17 +7433,26 @@ pub(crate) fn resolve_outpoint_spent_by_ids_batch_v2(
         .iter()
         .map(|id| table.outpoint_spent_by_id_point_key(*id))
         .collect();
+    
+    let step_start = std::time::Instant::now();
     let raws = provider
         .get_blob_multi_values(GetMultiValuesParams { blockhash: StateAt::Latest, keys })?
         .values;
+    eprintln!("[resolve_outpoint_spent_by_ids_batch_v2] get_blob_multi_values took {}ms for {} IDs", 
+        step_start.elapsed().as_millis(), ids_count);
+    
     let target = resolve_target_blockhash(provider, blockhash);
     let active_tip = provider
         .resolved_view_blockhash()
         .filter(|_| provider.view_blockhash().is_none());
     let fast_active = matches!(target, Some(t) if Some(t) == active_tip);
+    
+    let step_start = std::time::Instant::now();
+    let mut blockhash_lookups = 0usize;
+    let mut slow_lookups = 0usize;
     let mut active_blockhash_by_height: HashMap<u32, Option<BlockHash>> = HashMap::new();
     let mut out = Vec::with_capacity(outpoint_ids.len());
-    for raw in raws {
+    for (idx, raw) in raws.into_iter().enumerate() {
         let Some(raw) = raw else {
             out.push(None);
             continue;
@@ -7410,7 +7465,15 @@ pub(crate) fn resolve_outpoint_spent_by_ids_batch_v2(
                     if let Some(cached) = active_blockhash_by_height.get(&entry.height) {
                         *cached
                     } else {
+                        blockhash_lookups += 1;
+                        let lookup_start = std::time::Instant::now();
                         let found = provider.blockhash_for_height(entry.height).unwrap_or(None);
+                        let lookup_ms = lookup_start.elapsed().as_millis();
+                        if lookup_ms > 200 {
+                            slow_lookups += 1;
+                            eprintln!("[resolve_outpoint_spent_by_ids_batch_v2] SLOW blockhash_for_height({}): {}ms for ID {}", 
+                                entry.height, lookup_ms, outpoint_ids[idx]);
+                        }
                         active_blockhash_by_height.insert(entry.height, found);
                         found
                     };
@@ -7421,9 +7484,23 @@ pub(crate) fn resolve_outpoint_spent_by_ids_batch_v2(
             }
             out.push(chosen);
         } else {
-            out.push(resolve_visible_bytes32_entry(provider, &entries, target));
+            let resolve_start = std::time::Instant::now();
+            let result = resolve_visible_bytes32_entry(provider, &entries, target);
+            let resolve_ms = resolve_start.elapsed().as_millis();
+            if resolve_ms > 200 {
+                slow_lookups += 1;
+                eprintln!("[resolve_outpoint_spent_by_ids_batch_v2] SLOW resolve_visible_bytes32_entry: {}ms for ID {}", 
+                    resolve_ms, outpoint_ids[idx]);
+            }
+            out.push(result);
         }
     }
+    eprintln!("[resolve_outpoint_spent_by_ids_batch_v2] process_results took {}ms ({} blockhash_for_height lookups, {} slow >200ms)", 
+        step_start.elapsed().as_millis(), blockhash_lookups, slow_lookups);
+    
+    eprintln!("[resolve_outpoint_spent_by_ids_batch_v2] TOTAL took {}ms for {} IDs", 
+        total_start.elapsed().as_millis(), ids_count);
+    
     Ok(out)
 }
 

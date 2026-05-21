@@ -4475,8 +4475,17 @@ pub fn get_outpoint_balances_with_spent_batch(
     provider: &EssentialsProvider,
     outpoints: &[(Txid, u32)],
 ) -> Result<HashMap<(Txid, u32), OutpointLookup>> {
+    let total_start = std::time::Instant::now();
+    let outpoints_count = outpoints.len();
+    
     let table = provider.table();
+    
+    // Step 1: Resolve outpoint IDs
+    let step_start = std::time::Instant::now();
     let ids = resolve_outpoint_ids_batch_v2(provider, blockhash, outpoints)?;
+    eprintln!("[get_outpoint_balances_with_spent_batch] resolve_outpoint_ids_batch_v2 took {}ms for {} outpoints", 
+        step_start.elapsed().as_millis(), outpoints_count);
+    
     let mut unique_ids: Vec<u64> = Vec::new();
     let mut seen_ids: HashSet<u64> = HashSet::new();
     for id in ids.iter().flatten() {
@@ -4484,9 +4493,13 @@ pub fn get_outpoint_balances_with_spent_batch(
             unique_ids.push(*id);
         }
     }
+    eprintln!("[get_outpoint_balances_with_spent_batch] {} unique IDs from {} outpoints", unique_ids.len(), outpoints_count);
+    
+    // Step 2: Fetch outpoint pointer blobs
     let mut row_by_id: HashMap<u64, crate::modules::essentials::storage::OutpointPointerBlobV3> =
         HashMap::new();
     if !unique_ids.is_empty() {
+        let step_start = std::time::Instant::now();
         let row_keys: Vec<Vec<u8>> =
             unique_ids.iter().map(|id| table.outpoint_pointer_blob_key(*id)).collect();
         let row_vals = provider
@@ -4495,6 +4508,9 @@ pub fn get_outpoint_balances_with_spent_batch(
                 keys: row_keys,
             })?
             .values;
+        eprintln!("[get_outpoint_balances_with_spent_batch] get_blob_multi_values (pointer blobs) took {}ms for {} keys", 
+            step_start.elapsed().as_millis(), unique_ids.len());
+        
         for (id, row_raw) in unique_ids.iter().copied().zip(row_vals.into_iter()) {
             let Some(row_raw) = row_raw else { continue };
             let Ok(row) = decode_outpoint_pointer_blob_v3(&row_raw) else {
@@ -4503,16 +4519,23 @@ pub fn get_outpoint_balances_with_spent_batch(
             row_by_id.insert(id, row);
         }
     }
+    
+    // Step 3: Resolve spent status
     let mut spent_by_id: HashMap<u64, Option<Txid>> = HashMap::new();
     if !unique_ids.is_empty() {
+        let step_start = std::time::Instant::now();
         let spent_vals =
             resolve_outpoint_spent_by_ids_batch_v2(provider, blockhash, unique_ids.as_slice())?;
+        eprintln!("[get_outpoint_balances_with_spent_batch] resolve_outpoint_spent_by_ids_batch_v2 took {}ms for {} IDs", 
+            step_start.elapsed().as_millis(), unique_ids.len());
+        
         for (id, spent_raw) in unique_ids.iter().copied().zip(spent_vals.into_iter()) {
             let spent = spent_raw.and_then(|arr| Txid::from_slice(&arr).ok());
             spent_by_id.insert(id, spent);
         }
     }
 
+    // Step 4: Build output map
     let mut out: HashMap<(Txid, u32), OutpointLookup> = HashMap::new();
     for ((txid, vout), id) in outpoints.iter().zip(ids.into_iter()) {
         let spent_by = id.and_then(|rid| spent_by_id.get(&rid).cloned().flatten());
@@ -4524,6 +4547,10 @@ pub fn get_outpoint_balances_with_spent_batch(
         });
         out.insert((*txid, *vout), OutpointLookup { balances, spent_by, address, spk });
     }
+    
+    eprintln!("[get_outpoint_balances_with_spent_batch] TOTAL took {}ms for {} outpoints", 
+        total_start.elapsed().as_millis(), outpoints_count);
+    
     Ok(out)
 }
 

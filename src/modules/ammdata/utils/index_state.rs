@@ -79,6 +79,8 @@ pub struct IndexState {
     pub token_derived_usd_candle_writes: Vec<(Vec<u8>, Vec<u8>)>,
     pub token_derived_mcusd_candle_writes: Vec<(Vec<u8>, Vec<u8>)>,
     pub chart_change_writes: Vec<(Vec<u8>, Vec<u8>)>,
+    // DIESEL mint cost candles (tracking minting cost over time)
+    pub diesel_mint_cost_candle_writes: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 impl IndexState {
@@ -149,6 +151,7 @@ impl IndexState {
             token_derived_usd_candle_writes: Vec::new(),
             token_derived_mcusd_candle_writes: Vec::new(),
             chart_change_writes: Vec::new(),
+            diesel_mint_cost_candle_writes: Vec::new(),
         }
     }
 }

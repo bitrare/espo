@@ -29,6 +29,7 @@ struct VerboseBlockTxForFees {
     fee: Option<f64>,
 }
 
+/// Convert weight and fee in BTC to a FeeRateEntry
 pub fn fee_rate_entry_from_weight_and_btc_fee(
     weight: u64,
     fee_btc: Option<f64>,

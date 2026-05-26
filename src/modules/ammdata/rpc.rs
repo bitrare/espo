@@ -1,8 +1,8 @@
 use crate::modules::ammdata::storage::{
     AmmDataProvider, RpcFindBestSwapPathParams, RpcGetActivityParams, RpcGetAmmFactoriesParams,
     RpcGetBestMevSwapParams, RpcGetBtcUsdPriceParams, RpcGetCandlesParams,
-    RpcGetChartChangeBlockParams, RpcGetChartChangesBlockParams, RpcGetPoolsParams,
-    RpcGetTokenActivityParams, RpcGetTotalVolumeAmmParams, RpcPingParams,
+    RpcGetChartChangeBlockParams, RpcGetChartChangesBlockParams, RpcGetDieselMintCostCandlesParams,
+    RpcGetPoolsParams, RpcGetTokenActivityParams, RpcGetTotalVolumeAmmParams, RpcPingParams,
 };
 use crate::modules::defs::RpcNsRegistrar;
 use serde_json::{Value, json};
@@ -48,6 +48,45 @@ pub fn register_rpc(reg: &RpcNsRegistrar, provider: Arc<AmmDataProvider>) {
                         }
                     };
                     view.rpc_get_candles(params)
+                        .map(|resp| resp.value)
+                        .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                }
+            })
+            .await;
+    });
+
+    // DIESEL mint cost candles endpoint
+    let reg_diesel_candles = reg.clone();
+    let mdb_ptr_diesel_candles: Arc<AmmDataProvider> = Arc::clone(&mdb_ptr);
+    tokio::spawn(async move {
+        let mdb_for_handler = Arc::clone(&mdb_ptr_diesel_candles);
+        reg_diesel_candles
+            .register("get_diesel_mint_cost_candles", move |_cx, payload| {
+                let mdb = Arc::clone(&mdb_for_handler);
+                async move {
+                    let params = RpcGetDieselMintCostCandlesParams {
+                        timeframe: payload
+                            .get("timeframe")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
+                        limit: payload.get("limit").and_then(|v| v.as_u64()),
+                        page: payload.get("page").and_then(|v| v.as_u64()),
+                        now: payload.get("now").and_then(|v| v.as_u64()),
+                    };
+                    let view = match mdb.with_height(
+                        payload.get("height").and_then(|v| v.as_u64()),
+                        payload.get("height").is_some(),
+                    ) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            return json!({
+                                "ok": false,
+                                "error": "missing_or_invalid_height",
+                                "detail": e.to_string()
+                            });
+                        }
+                    };
+                    view.rpc_get_diesel_mint_cost_candles(params)
                         .map(|resp| resp.value)
                         .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
                 }

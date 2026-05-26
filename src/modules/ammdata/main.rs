@@ -571,6 +571,82 @@ pub(crate) fn load_balance_txs_by_height(
     Ok(parsed)
 }
 
+/// Index DIESEL mint cost candles from essentials block summary
+fn index_diesel_mint_cost_candles(
+    block_ts: u64,
+    height: u32,
+    provider: &AmmDataProvider,
+    essentials: &EssentialsProvider,
+    state: &mut crate::modules::ammdata::utils::index_state::IndexState,
+) {
+    use crate::modules::ammdata::storage::{encode_candle_v1, decode_candle_v1, GetRawValueParams};
+    use crate::modules::essentials::storage::GetBlockSummaryParams;
+    
+    // Get block summary from essentials
+    let summary = match essentials.get_block_summary(GetBlockSummaryParams {
+        blockhash: StateAt::Latest,
+        height,
+    }) {
+        Ok(resp) => match resp.summary {
+            Some(s) => s,
+            None => return,
+        },
+        Err(_) => return,
+    };
+    
+    // Skip if no diesel mints in this block
+    if summary.diesel_mint_count == 0 {
+        return;
+    }
+    
+    // The mint cost is in sats per DIESEL (scaled by 1e8)
+    // Convert to PRICE_SCALE for candle storage
+    let mint_cost_sats = summary.diesel_mint_cost_sats;
+    let mint_cost_scaled = (mint_cost_sats as u128).saturating_mul(PRICE_SCALE).saturating_div(100_000_000);
+    
+    // Volume is total fees paid (in sats, scaled to PRICE_SCALE)
+    let volume_scaled = (summary.diesel_total_fee_sats as u128).saturating_mul(PRICE_SCALE).saturating_div(100_000_000);
+    
+    // Active timeframes for candles
+    let frames = vec![Timeframe::M10];
+    let table = provider.table();
+    
+    for tf in frames {
+        let dur = tf.duration_secs();
+        let bucket_ts = (block_ts / dur) * dur;
+        let key = table.diesel_mint_cost_candle_key(tf, bucket_ts);
+        
+        // Check if there's an existing candle for this bucket
+        let existing = provider
+            .get_raw_value(GetRawValueParams { blockhash: StateAt::Latest, key: key.clone() })
+            .ok()
+            .and_then(|r| r.value)
+            .and_then(|v| decode_candle_v1(&v).ok());
+        
+        let candle = if let Some(mut existing) = existing {
+            // Update existing candle
+            existing.high = existing.high.max(mint_cost_scaled);
+            existing.low = existing.low.min(mint_cost_scaled);
+            existing.close = mint_cost_scaled;
+            existing.volume = existing.volume.saturating_add(volume_scaled);
+            existing
+        } else {
+            // Create new candle
+            SchemaCandleV1 {
+                open: mint_cost_scaled,
+                high: mint_cost_scaled,
+                low: mint_cost_scaled,
+                close: mint_cost_scaled,
+                volume: volume_scaled,
+            }
+        };
+        
+        if let Ok(encoded) = encode_candle_v1(&candle) {
+            state.diesel_mint_cost_candle_writes.push((key, encoded));
+        }
+    }
+}
+
 pub struct AmmData {
     provider: Option<Arc<AmmDataProvider>>,
     index_height: Arc<std::sync::RwLock<Option<u32>>>,
@@ -790,6 +866,17 @@ impl EspoModule for AmmData {
             &mut state,
         )?;
         debug::log_elapsed(module, "total_volume_amm", timer);
+
+        // Index DIESEL mint cost candles from essentials block summary
+        let timer = debug::start_if(debug);
+        index_diesel_mint_cost_candles(
+            block_ts,
+            height,
+            provider,
+            essentials,
+            &mut state,
+        );
+        debug::log_elapsed(module, "diesel_mint_cost_candles", timer);
 
         let timer = debug::start_if(debug);
         let finalize =

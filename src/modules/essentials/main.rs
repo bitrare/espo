@@ -8,8 +8,9 @@ use crate::modules::essentials::consts::{
 };
 use crate::modules::essentials::rpc;
 use crate::modules::essentials::storage::{
-    BlockSummary, BlockSummaryPool, EssentialsProvider, GetRawValueParams, cache_block_summary,
-    compute_block_fee_rate_summary, encode_creation_record,
+    BlockSummary, BlockSummaryPool, DieselBlockStats, EssentialsProvider, GetRawValueParams, 
+    cache_block_summary, compute_block_fee_rate_summary, compute_diesel_block_stats, 
+    encode_creation_record, is_diesel_mint_tx_sandshrew,
 };
 use crate::modules::essentials::utils::creation_meta::{get_cap, get_value_per_mint};
 use crate::modules::essentials::utils::inspections::{
@@ -24,7 +25,7 @@ use crate::runtime::mdb::Mdb;
 use crate::runtime::state_at::StateAt;
 use crate::schemas::SchemaAlkaneId;
 use anyhow::Result;
-use bitcoin::Network;
+use bitcoin::{Network, Txid};
 use bitcoin::consensus::Encodable;
 use bitcoin::hashes::Hash;
 use std::collections::HashMap;
@@ -261,6 +262,30 @@ impl EspoModule for Essentials {
                 icon_url: display.icon_url,
             }
         });
+        
+        // Identify diesel mint txids for diesel stats computation
+        let diesel_txids: HashSet<Txid> = block
+            .transactions
+            .iter()
+            .filter_map(|tx| {
+                let traces = tx.traces.as_ref()?;
+                let sandshrew_traces: Vec<_> = traces.iter().map(|t| &t.sandshrew_trace).collect();
+                let sandshrew_refs: Vec<_> = sandshrew_traces.iter().map(|t| (*t).clone()).collect();
+                if is_diesel_mint_tx_sandshrew(&sandshrew_refs) {
+                    Some(tx.transaction.compute_txid())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        
+        // Compute diesel mining stats
+        let diesel_stats = compute_diesel_block_stats(&blockhash, block.height, &diesel_txids)
+            .unwrap_or_else(|e| {
+                eprintln!("[essentials] failed to compute diesel stats for block {}: {}", block.height, e);
+                DieselBlockStats::default()
+            });
+        
         let block_summary = BlockSummary {
             height: block.height,
             blockhash: blockhash.to_byte_array(),
@@ -272,6 +297,12 @@ impl EspoModule for Essentials {
             fee_median: fee_summary.median,
             fee_range: fee_summary.range.to_vec(),
             pool,
+            diesel_mint_count: diesel_stats.mint_count,
+            diesel_total_fee_sats: diesel_stats.total_fee_sats,
+            diesel_min_fee_rate: diesel_stats.min_fee_rate,
+            diesel_reward_recipients: diesel_stats.reward_recipients,
+            diesel_distributed: diesel_stats.distributed,
+            diesel_mint_cost_sats: diesel_stats.mint_cost_sats,
         };
 
         let mut total_pairs_dedup = 0usize;
@@ -555,17 +586,33 @@ impl EspoModule for Essentials {
                                         .insert(factory_id, Some(offset));
                                     offset
                                 } else {
-                                    // Detect the start offset by calling simulate
-                                    let detected =
-                                        detect_orbital_start_offset(&rec.alkane, idx, block.height);
-                                    // Store it for future use
-                                    let mut offset_bytes = [0u8; 16];
-                                    offset_bytes.copy_from_slice(&detected.to_le_bytes());
-                                    orbital_collection_start_index_rows
-                                        .insert(key, offset_bytes.to_vec());
-                                    orbital_collection_start_index_cache
-                                        .insert(factory_id, Some(detected));
-                                    detected
+                                    // Only detect offset for the FIRST NFT (idx == 0) to avoid
+                                    // calling simulate on every NFT during reparse.
+                                    // For later NFTs without cached offset, use default of 1.
+                                    if idx == 0 {
+                                        // Detect the start offset by calling simulate on the first NFT
+                                        let detected =
+                                            detect_orbital_start_offset(&rec.alkane, idx, block.height);
+                                        // Store it for future use
+                                        let mut offset_bytes = [0u8; 16];
+                                        offset_bytes.copy_from_slice(&detected.to_le_bytes());
+                                        orbital_collection_start_index_rows
+                                            .insert(key, offset_bytes.to_vec());
+                                        orbital_collection_start_index_cache
+                                            .insert(factory_id, Some(detected));
+                                        detected
+                                    } else {
+                                        // For NFTs that aren't the first, use default offset
+                                        // This avoids expensive simulate calls during reparse
+                                        // The offset will be correctly detected when the first NFT is processed
+                                        eprintln!(
+                                            "[ESSENTIALS] orbital offset not cached for factory {}:{}, NFT idx={}, using default 1",
+                                            factory_id.block, factory_id.tx, idx
+                                        );
+                                        orbital_collection_start_index_cache
+                                            .insert(factory_id, Some(1));
+                                        1
+                                    }
                                 }
                             };
                             let constructed =

@@ -35,7 +35,123 @@ use crate::runtime::mempool::{
 };
 use crate::utils::electrum_like::{AddressHistoryEntry, AddressUtxo, ElectrumLikeBackend};
 pub use crate::utils::fee_rates::{BlockFeeRateSummary, compute_block_fee_rate_summary};
+use crate::utils::fee_rates::fee_rate_entry_from_weight_and_btc_fee;
 use anyhow::{Result, anyhow};
+
+/// Diesel mining stats for a block
+#[derive(Clone, Debug, Default)]
+pub struct DieselBlockStats {
+    pub mint_count: u32,
+    pub total_fee_sats: u64,
+    pub min_fee_rate: f64,
+    pub reward_recipients: u32,
+    pub distributed: u64,       // base units (1e8), e.g., 312500000 for 3.125 DIESEL
+    pub mint_cost_sats: u64,    // cost per DIESEL in sats
+}
+
+/// DIESEL constants
+const DIESEL_BASE_REWARD: u64 = 312_500_000; // 3.125 DIESEL in base units (1e8)
+/// Block height where DIESEL minting changed from winner-takes-all to shared minting
+/// - Up to 909,861: Winner-takes-all (only winning tx appears, gets full 3.125 DIESEL)
+/// - From 909,862: Shared minting (all mint txs share 3.125 DIESEL)
+const DIESEL_SHARED_MINT_FORK_HEIGHT: u32 = 909_862;
+
+/// Compute diesel mining stats for a block given the diesel mint txids
+pub fn compute_diesel_block_stats(
+    blockhash: &BlockHash,
+    height: u32,
+    diesel_txids: &HashSet<Txid>,
+) -> Result<DieselBlockStats> {
+    if diesel_txids.is_empty() {
+        return Ok(DieselBlockStats::default());
+    }
+
+    // Fetch block with verbosity 3 to get per-tx fee data
+    let rpc = get_bitcoind_rpc_client();
+    let block: VerboseBlockForDieselStats = rpc
+        .call("getblock", &[json!(blockhash.to_string()), json!(3)])
+        .map_err(|e| anyhow!("bitcoind getblock({blockhash}, 3) for diesel stats failed: {e}"))?;
+
+    let mut total_fee_sats: u64 = 0;
+    let mut min_fee_sats: u64 = u64::MAX;
+    let mut min_fee_rate: f64 = f64::MAX;
+    let mut mint_count: u32 = 0;
+
+    for tx in &block.tx {
+        let txid = match Txid::from_str(&tx.txid) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        if !diesel_txids.contains(&txid) {
+            continue;
+        }
+        mint_count += 1;
+
+        // Compute fee
+        let fee_sat = tx.fee.map(|f| (f * 100_000_000.0) as u64).unwrap_or(0);
+        total_fee_sats += fee_sat;
+        if fee_sat < min_fee_sats {
+            min_fee_sats = fee_sat;
+        }
+
+        // Compute fee rate
+        if let Some(entry) = fee_rate_entry_from_weight_and_btc_fee(tx.weight, tx.fee) {
+            if entry.rate < min_fee_rate {
+                min_fee_rate = entry.rate;
+            }
+        }
+    }
+
+    if min_fee_rate == f64::MAX {
+        min_fee_rate = 0.0;
+    }
+    if min_fee_sats == u64::MAX {
+        min_fee_sats = 0;
+    }
+
+    // reward_recipients = number of diesel mint transactions in the block
+    let (reward_recipients, distributed) = if mint_count > 0 {
+        (mint_count, DIESEL_BASE_REWARD)
+    } else {
+        (0, 0)
+    };
+
+    // Calculate mint cost per DIESEL in sats based on era
+    let mint_cost_sats = if distributed > 0 {
+        if height < DIESEL_SHARED_MINT_FORK_HEIGHT {
+            // Winner-takes-all era (up to block 909,861):
+            // Only the winning tx appears, cost = winner's fee / 3.125 DIESEL
+            (total_fee_sats as u128 * 100_000_000 / distributed as u128) as u64
+        } else {
+            // Shared minting era (from block 909,862):
+            // All miners share 3.125 DIESEL, cost = min_fee * N / 3.125
+            (min_fee_sats as u128 * mint_count as u128 * 100_000_000 / distributed as u128) as u64
+        }
+    } else {
+        0
+    };
+
+    Ok(DieselBlockStats {
+        mint_count,
+        total_fee_sats,
+        min_fee_rate,
+        reward_recipients,
+        distributed,
+        mint_cost_sats,
+    })
+}
+
+#[derive(serde::Deserialize)]
+struct VerboseBlockForDieselStats {
+    tx: Vec<VerboseBlockTxForDieselStats>,
+}
+
+#[derive(serde::Deserialize)]
+struct VerboseBlockTxForDieselStats {
+    txid: String,
+    weight: u64,
+    fee: Option<f64>,
+}
 use hex;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::str::FromStr;
@@ -116,7 +232,7 @@ fn is_diesel_mint_trace_sandshrew(trace: &EspoSandshrewLikeTrace) -> bool {
 }
 
 /// Check if a tx is a diesel mint (single trace that matches diesel mint pattern).
-fn is_diesel_mint_tx_sandshrew(traces: &[EspoSandshrewLikeTrace]) -> bool {
+pub fn is_diesel_mint_tx_sandshrew(traces: &[EspoSandshrewLikeTrace]) -> bool {
     traces.len() == 1 && is_diesel_mint_trace_sandshrew(&traces[0])
 }
 
@@ -3795,6 +3911,7 @@ impl EssentialsProvider {
             fee_median,
             fee_range,
             pool,
+            diesel_stats,
             found,
         ) = if let Some(summary) = summary {
             let blockhash = summary.block_hash().map(|h| h.to_string());
@@ -3809,6 +3926,14 @@ impl EssentialsProvider {
                     "icon_url": pool.icon_url,
                 })
             });
+            let diesel = json!({
+                "mint_count": summary.diesel_mint_count,
+                "total_fee_sats": summary.diesel_total_fee_sats,
+                "min_fee_rate": summary.diesel_min_fee_rate,
+                "reward_recipients": summary.diesel_reward_recipients,
+                "distributed": summary.diesel_distributed,
+                "mint_cost_sats": summary.diesel_mint_cost_sats,
+            });
             (
                 summary.trace_count,
                 summary.interaction_count,
@@ -3819,10 +3944,11 @@ impl EssentialsProvider {
                 summary.fee_median,
                 summary.fee_range,
                 pool,
+                Some(diesel),
                 true,
             )
         } else {
-            (0, 0, 0, None, None, 0.0, 0.0, Vec::new(), None, false)
+            (0, 0, 0, None, None, 0.0, 0.0, Vec::new(), None, None, false)
         };
 
         Ok(RpcGetBlockSummaryResult {
@@ -3839,6 +3965,7 @@ impl EssentialsProvider {
                 "fee_median": fee_median,
                 "fee_range": fee_range,
                 "pool": pool,
+                "diesel": diesel_stats,
             }),
         })
     }
@@ -7167,6 +7294,27 @@ pub struct BlockSummary {
     pub fee_median: f64,
     pub fee_range: Vec<f64>,
     pub pool: Option<BlockSummaryPool>,
+    // DIESEL mining stats (added in V5)
+    pub diesel_mint_count: u32,
+    pub diesel_total_fee_sats: u64,
+    pub diesel_min_fee_rate: f64,
+    pub diesel_reward_recipients: u32,
+    pub diesel_distributed: u64, // in base units (1e8), e.g., 312500000 for 3.125 DIESEL
+    pub diesel_mint_cost_sats: u64, // cost per DIESEL in sats
+}
+
+#[derive(Clone, Debug, BorshDeserialize)]
+struct LegacyBlockSummaryV4 {
+    pub height: u32,
+    pub blockhash: [u8; 32],
+    pub trace_count: u32,
+    pub interaction_count: u32,
+    pub tx_count: u32,
+    pub header: Vec<u8>,
+    pub fee_avg: f64,
+    pub fee_median: f64,
+    pub fee_range: Vec<f64>,
+    pub pool: Option<BlockSummaryPool>,
 }
 
 #[derive(Clone, Debug, BorshDeserialize)]
@@ -7212,6 +7360,26 @@ impl BlockSummary {
         Self::try_from_slice(raw)
             .ok()
             .or_else(|| {
+                LegacyBlockSummaryV4::try_from_slice(raw).ok().map(|legacy| Self {
+                    height: legacy.height,
+                    blockhash: legacy.blockhash,
+                    trace_count: legacy.trace_count,
+                    interaction_count: legacy.interaction_count,
+                    tx_count: legacy.tx_count,
+                    header: legacy.header,
+                    fee_avg: legacy.fee_avg,
+                    fee_median: legacy.fee_median,
+                    fee_range: legacy.fee_range,
+                    pool: legacy.pool,
+                    diesel_mint_count: 0,
+                    diesel_total_fee_sats: 0,
+                    diesel_min_fee_rate: 0.0,
+                    diesel_reward_recipients: 0,
+                    diesel_distributed: 0,
+                    diesel_mint_cost_sats: 0,
+                })
+            })
+            .or_else(|| {
                 LegacyBlockSummaryV3::try_from_slice(raw).ok().map(|legacy| Self {
                     height: legacy.height,
                     blockhash: legacy.blockhash,
@@ -7223,6 +7391,12 @@ impl BlockSummary {
                     fee_median: legacy.fee_median,
                     fee_range: legacy.fee_range,
                     pool: None,
+                    diesel_mint_count: 0,
+                    diesel_total_fee_sats: 0,
+                    diesel_min_fee_rate: 0.0,
+                    diesel_reward_recipients: 0,
+                    diesel_distributed: 0,
+                    diesel_mint_cost_sats: 0,
                 })
             })
             .or_else(|| {
@@ -7237,6 +7411,12 @@ impl BlockSummary {
                     fee_median: legacy.fee_median,
                     fee_range: legacy.fee_range,
                     pool: None,
+                    diesel_mint_count: 0,
+                    diesel_total_fee_sats: 0,
+                    diesel_min_fee_rate: 0.0,
+                    diesel_reward_recipients: 0,
+                    diesel_distributed: 0,
+                    diesel_mint_cost_sats: 0,
                 })
             })
             .or_else(|| {
@@ -7251,6 +7431,12 @@ impl BlockSummary {
                     fee_median: 0.0,
                     fee_range: Vec::new(),
                     pool: None,
+                    diesel_mint_count: 0,
+                    diesel_total_fee_sats: 0,
+                    diesel_min_fee_rate: 0.0,
+                    diesel_reward_recipients: 0,
+                    diesel_distributed: 0,
+                    diesel_mint_cost_sats: 0,
                 })
             })
             .or_else(|| {
@@ -7265,6 +7451,12 @@ impl BlockSummary {
                     fee_median: 0.0,
                     fee_range: Vec::new(),
                     pool: None,
+                    diesel_mint_count: 0,
+                    diesel_total_fee_sats: 0,
+                    diesel_min_fee_rate: 0.0,
+                    diesel_reward_recipients: 0,
+                    diesel_distributed: 0,
+                    diesel_mint_cost_sats: 0,
                 })
             })
     }

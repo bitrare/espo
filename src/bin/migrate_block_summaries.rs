@@ -187,6 +187,13 @@ fn main() -> Result<()> {
             fee_median: fee_summary.median,
             fee_range: fee_summary.range.to_vec(),
             pool,
+            // Diesel fields not computed during migration (requires reparse)
+            diesel_mint_count: 0,
+            diesel_total_fee_sats: 0,
+            diesel_min_fee_rate: 0.0,
+            diesel_reward_recipients: 0,
+            diesel_distributed: 0,
+            diesel_mint_cost_sats: 0,
         };
 
         if let Err(err) = provider.put_block_summary_indexes(&new_summary) {

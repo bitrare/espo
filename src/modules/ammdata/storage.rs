@@ -81,6 +81,8 @@ pub struct AmmDataTable<'a> {
     pub BTC_USD_LINE: ListPointer<'a>,
     pub TOTAL_VOLUME_AMM: KvPointer<'a>,
     pub TOKEN_DERIVED_MCAP_USD_CANDLES: ListPointer<'a>,
+    // DIESEL mint cost candles (dmc1:<tf>:<bucket_ts>)
+    pub DIESEL_MINT_COST_CANDLES: ListPointer<'a>,
     pub CHART_CHANGE_EVENTS: KvPointer<'a>,
     pub CHART_CHANGE_LATEST: KvPointer<'a>,
     // Activity logs + secondary indexes for sort/paging.
@@ -141,6 +143,7 @@ impl<'a> AmmDataTable<'a> {
             BTC_USD_LINE: root.list_keyword("btu1:"),
             TOTAL_VOLUME_AMM: root.keyword("/total_volume_amm/v1/"),
             TOKEN_DERIVED_MCAP_USD_CANDLES: root.list_keyword("tdmc1:"),
+            DIESEL_MINT_COST_CANDLES: root.list_keyword("dmc1:"),
             CHART_CHANGE_EVENTS: root.keyword("/chart_change_events/v1/"),
             CHART_CHANGE_LATEST: root.keyword("/chart_change_latest/v1/"),
             ACTIVITY: root.list_keyword("activity:v1:"),
@@ -540,6 +543,19 @@ impl<'a> AmmDataTable<'a> {
         bucket_ts: u64,
     ) -> Vec<u8> {
         let mut k = self.token_derived_mcusd_candle_ns_prefix(token, quote, tf);
+        k.extend_from_slice(bucket_ts.to_string().as_bytes());
+        k
+    }
+
+    /// DIESEL mint cost candles namespace prefix for a given timeframe
+    pub fn diesel_mint_cost_candle_ns_prefix(&self, tf: Timeframe) -> Vec<u8> {
+        let suffix = format!("{}:", tf.code());
+        self.DIESEL_MINT_COST_CANDLES.select(suffix.as_bytes()).key().to_vec()
+    }
+
+    /// DIESEL mint cost candles key for a specific bucket
+    pub fn diesel_mint_cost_candle_key(&self, tf: Timeframe, bucket_ts: u64) -> Vec<u8> {
+        let mut k = self.diesel_mint_cost_candle_ns_prefix(tf);
         k.extend_from_slice(bucket_ts.to_string().as_bytes());
         k
     }
@@ -4170,6 +4186,150 @@ impl AmmDataProvider {
         Ok(RpcPingResult { value: Value::String("pong".to_string()) })
     }
 
+    pub fn rpc_get_diesel_mint_cost_candles(
+        &self,
+        params: RpcGetDieselMintCostCandlesParams,
+    ) -> Result<RpcGetDieselMintCostCandlesResult> {
+        let tf = params.timeframe.as_deref().and_then(parse_timeframe).unwrap_or(Timeframe::M10);
+        let limit = params.limit.map(|n| n as usize).unwrap_or(120);
+        let page = params.page.map(|n| n as usize).unwrap_or(1);
+        let now = params.now.unwrap_or_else(now_ts);
+        let table = self.table();
+        let dur = tf.duration_secs();
+        
+        // Read all diesel mint cost candles for this timeframe
+        let prefix = table.diesel_mint_cost_candle_ns_prefix(tf);
+        let mut per_bucket: std::collections::BTreeMap<u64, SchemaCandleV1> = std::collections::BTreeMap::new();
+        
+        for (k, v) in self
+            .get_list_entries_desc(GetListEntriesDescParams { blockhash: StateAt::Latest, prefix })?
+            .entries
+        {
+            if let Some(ts_bytes) = k.rsplit(|&b| b == b':').next() {
+                if let Ok(ts_str) = std::str::from_utf8(ts_bytes) {
+                    if let Ok(ts) = ts_str.parse::<u64>() {
+                        if !per_bucket.contains_key(&ts) {
+                            if let Ok(c) = decode_candle_v1(&v) {
+                                per_bucket.insert(ts, c);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        if per_bucket.is_empty() {
+            return Ok(RpcGetDieselMintCostCandlesResult {
+                value: json!({
+                    "ok": true,
+                    "timeframe": tf.code(),
+                    "candles": [],
+                    "page": page,
+                    "limit": limit,
+                    "has_more": false,
+                    "total": 0
+                }),
+            });
+        }
+        
+        // Fill gaps and build continuous candle series
+        let start_bucket = *per_bucket.keys().next().unwrap();
+        let newest_bucket_with_data = *per_bucket.keys().last().unwrap();
+        let newest_bucket_now = (now / dur) * dur;
+        
+        let mut last_close: u128 = 0;
+        let mut have_prev: bool = false;
+        let mut forward: std::collections::BTreeMap<u64, SchemaCandleV1> = std::collections::BTreeMap::new();
+        let mut bts = start_bucket;
+        
+        while bts <= newest_bucket_with_data {
+            if let Some(c) = per_bucket.get(&bts) {
+                let mut candle = *c;
+                if have_prev {
+                    candle.open = last_close;
+                    if candle.open > candle.high {
+                        candle.high = candle.open;
+                    }
+                    if candle.open < candle.low {
+                        candle.low = candle.open;
+                    }
+                }
+                last_close = candle.close;
+                have_prev = true;
+                forward.insert(bts, candle);
+            } else if have_prev {
+                let candle = SchemaCandleV1 {
+                    open: last_close,
+                    high: last_close,
+                    low: last_close,
+                    close: last_close,
+                    volume: 0,
+                };
+                forward.insert(bts, candle);
+            }
+            bts = match bts.checked_add(dur) {
+                Some(n) => n,
+                None => break,
+            };
+        }
+        
+        // Fill up to current time
+        if newest_bucket_now > newest_bucket_with_data && have_prev {
+            let mut t = newest_bucket_with_data.saturating_add(dur);
+            while t <= newest_bucket_now {
+                let candle = SchemaCandleV1 {
+                    open: last_close,
+                    high: last_close,
+                    low: last_close,
+                    close: last_close,
+                    volume: 0,
+                };
+                forward.insert(t, candle);
+                t = match t.checked_add(dur) {
+                    Some(n) => n,
+                    None => break,
+                };
+            }
+        }
+        
+        // Convert to JSON output (newest first)
+        let total = forward.len();
+        let offset = (page - 1) * limit;
+        let candles_newest_first: Vec<_> = forward.into_iter().rev().collect();
+        let page_candles: Vec<Value> = candles_newest_first
+            .iter()
+            .skip(offset)
+            .take(limit)
+            .map(|(ts, c)| {
+                // Convert scaled price back to sats (divide by PRICE_SCALE, multiply by 1e8)
+                let price_sats = c.close.saturating_mul(100_000_000) / crate::modules::ammdata::consts::PRICE_SCALE;
+                json!({
+                    "timestamp": *ts,
+                    "open": c.open.to_string(),
+                    "high": c.high.to_string(),
+                    "low": c.low.to_string(),
+                    "close": c.close.to_string(),
+                    "volume": c.volume.to_string(),
+                    "close_sats": price_sats.to_string()
+                })
+            })
+            .collect();
+        
+        let has_more = offset + page_candles.len() < total;
+        
+        Ok(RpcGetDieselMintCostCandlesResult {
+            value: json!({
+                "ok": true,
+                "timeframe": tf.code(),
+                "candles": page_candles,
+                "page": page,
+                "limit": limit,
+                "has_more": has_more,
+                "total": total
+            }),
+        })
+    }
+
     pub fn rpc_get_btc_usd_price(
         &self,
         params: RpcGetBtcUsdPriceParams,
@@ -5004,6 +5164,17 @@ pub struct RpcGetTotalVolumeAmmResult {
 pub struct RpcPingParams;
 
 pub struct RpcPingResult {
+    pub value: Value,
+}
+
+pub struct RpcGetDieselMintCostCandlesParams {
+    pub timeframe: Option<String>,
+    pub limit: Option<u64>,
+    pub page: Option<u64>,
+    pub now: Option<u64>,
+}
+
+pub struct RpcGetDieselMintCostCandlesResult {
     pub value: Value,
 }
 

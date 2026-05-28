@@ -4190,17 +4190,18 @@ impl AmmDataProvider {
         &self,
         params: RpcGetDieselMintCostCandlesParams,
     ) -> Result<RpcGetDieselMintCostCandlesResult> {
-        let tf = params.timeframe.as_deref().and_then(parse_timeframe).unwrap_or(Timeframe::M10);
+        let tf = params.timeframe.as_deref().and_then(parse_timeframe).unwrap_or(Timeframe::D1);
         let limit = params.limit.map(|n| n as usize).unwrap_or(120);
         let page = params.page.map(|n| n as usize).unwrap_or(1);
         let now = params.now.unwrap_or_else(now_ts);
         let table = self.table();
         let dur = tf.duration_secs();
-        
-        // Read all diesel mint cost candles for this timeframe
-        let prefix = table.diesel_mint_cost_candle_ns_prefix(tf);
-        let mut per_bucket: std::collections::BTreeMap<u64, SchemaCandleV1> = std::collections::BTreeMap::new();
-        
+
+        // Diesel mint cost candles are persisted only at the base M10 granularity.
+        // Read the M10 series and aggregate it up into the requested timeframe so the
+        // chart can offer 10m / 1h / 4h / 1d / 1w / 1M without requiring a reparse.
+        let prefix = table.diesel_mint_cost_candle_ns_prefix(Timeframe::M10);
+        let mut m10: std::collections::BTreeMap<u64, SchemaCandleV1> = std::collections::BTreeMap::new();
         for (k, v) in self
             .get_list_entries_desc(GetListEntriesDescParams { blockhash: StateAt::Latest, prefix })?
             .entries
@@ -4208,16 +4209,33 @@ impl AmmDataProvider {
             if let Some(ts_bytes) = k.rsplit(|&b| b == b':').next() {
                 if let Ok(ts_str) = std::str::from_utf8(ts_bytes) {
                     if let Ok(ts) = ts_str.parse::<u64>() {
-                        if !per_bucket.contains_key(&ts) {
+                        if !m10.contains_key(&ts) {
                             if let Ok(c) = decode_candle_v1(&v) {
-                                per_bucket.insert(ts, c);
+                                m10.insert(ts, c);
                             }
                         }
                     }
                 }
             }
         }
-        
+
+        // Aggregate base M10 candles into the requested timeframe buckets.
+        // BTreeMap iterates ascending, so `open` (first wins via or_insert) and
+        // `close` (last wins via and_modify) are assigned correctly.
+        let mut per_bucket: std::collections::BTreeMap<u64, SchemaCandleV1> = std::collections::BTreeMap::new();
+        for (ts, c) in m10.iter() {
+            let bucket = (ts / dur) * dur;
+            per_bucket
+                .entry(bucket)
+                .and_modify(|agg| {
+                    agg.high = agg.high.max(c.high);
+                    agg.low = agg.low.min(c.low);
+                    agg.close = c.close;
+                    agg.volume = agg.volume.saturating_add(c.volume);
+                })
+                .or_insert(*c);
+        }
+
         if per_bucket.is_empty() {
             return Ok(RpcGetDieselMintCostCandlesResult {
                 value: json!({

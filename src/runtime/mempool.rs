@@ -45,7 +45,7 @@ use std::io::{Cursor, Write};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
 
 /// --- Tunables (edit as needed) ---
@@ -349,6 +349,29 @@ static MEMPOOL_EVENTS: OnceLock<broadcast::Sender<String>> = OnceLock::new();
 static RECALCULATE_TEMPLATES_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static HYDRATION_RUNNING: AtomicBool = AtomicBool::new(false);
 
+// =============================================================================
+// MEMORY LEAK FIX: Throttle template recalculations
+// =============================================================================
+// The `recalculate_memory_templates` function is called very frequently:
+// - On every ZMQ rawtx message (thousands/minute during high activity)
+// - On every ZMQ sequence message
+// - Every 1000 hydrated transactions
+// - Every template_poll interval
+//
+// Each call clones the entire mempool state into HashMaps, allocating hundreds
+// of MBs that the allocator doesn't release back to the OS quickly. This causes
+// memory to grow unboundedly over time (observed: 14+ GB in ~20 minutes).
+//
+// FIX: Throttle recalculations to at most once every MIN_TEMPLATE_RECALC_MS.
+// This dramatically reduces allocation churn while keeping templates reasonably fresh.
+// =============================================================================
+static LAST_TEMPLATE_RECALC: OnceLock<Mutex<Instant>> = OnceLock::new();
+
+/// Minimum interval between template recalculations in milliseconds.
+/// This throttles the expensive cloning operations in recalculate_memory_templates().
+/// 2000ms (2 seconds) provides a good balance between freshness and memory efficiency.
+const MIN_TEMPLATE_RECALC_MS: u64 = 2000;
+
 fn mempool_state() -> &'static Arc<RwLock<InMemoryMempool>> {
     IN_MEMORY_MEMPOOL.get_or_init(|| Arc::new(RwLock::new(InMemoryMempool::default())))
 }
@@ -359,6 +382,12 @@ fn trace_queue() -> &'static Arc<Mutex<VecDeque<Txid>>> {
 
 fn recalculate_templates_lock() -> &'static Mutex<()> {
     RECALCULATE_TEMPLATES_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+/// Returns the mutex protecting the last template recalculation timestamp.
+/// Initialized to 60 seconds in the past to allow immediate first recalculation.
+fn last_template_recalc_time() -> &'static Mutex<Instant> {
+    LAST_TEMPLATE_RECALC.get_or_init(|| Mutex::new(Instant::now() - Duration::from_secs(60)))
 }
 
 pub fn subscribe_mempool_events() -> broadcast::Receiver<String> {
@@ -2364,6 +2393,29 @@ fn calculate_template_deltas(
 }
 
 fn recalculate_memory_templates() {
+    // =========================================================================
+    // THROTTLE CHECK: Prevent excessive template recalculations
+    // =========================================================================
+    // This function is called from many places (ZMQ handlers, hydration, etc.)
+    // and each call clones the entire mempool state. Without throttling, this
+    // causes severe memory growth (14+ GB observed in production).
+    //
+    // We enforce a minimum interval between recalculations to reduce allocation
+    // churn while still keeping templates reasonably up-to-date.
+    // =========================================================================
+    {
+        let Ok(mut last_recalc) = last_template_recalc_time().lock() else {
+            return;
+        };
+        let elapsed = last_recalc.elapsed();
+        if elapsed < Duration::from_millis(MIN_TEMPLATE_RECALC_MS) {
+            // Too soon since last recalculation - skip this one
+            return;
+        }
+        // Update timestamp before releasing lock to prevent race conditions
+        *last_recalc = Instant::now();
+    }
+
     let Ok(_recalculate_guard) = recalculate_templates_lock().try_lock() else {
         return;
     };

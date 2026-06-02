@@ -362,15 +362,11 @@ static HYDRATION_RUNNING: AtomicBool = AtomicBool::new(false);
 // of MBs that the allocator doesn't release back to the OS quickly. This causes
 // memory to grow unboundedly over time (observed: 14+ GB in ~20 minutes).
 //
-// FIX: Throttle recalculations to at most once every MIN_TEMPLATE_RECALC_MS.
-// This dramatically reduces allocation churn while keeping templates reasonably fresh.
+// FIX: Throttle recalculations using the configurable `mempool.template_recalc_ms`
+// setting (default: 2000ms). This dramatically reduces allocation churn while
+// keeping templates reasonably fresh. Adjust in config.json if needed.
 // =============================================================================
 static LAST_TEMPLATE_RECALC: OnceLock<Mutex<Instant>> = OnceLock::new();
-
-/// Minimum interval between template recalculations in milliseconds.
-/// This throttles the expensive cloning operations in recalculate_memory_templates().
-/// 2000ms (2 seconds) provides a good balance between freshness and memory efficiency.
-const MIN_TEMPLATE_RECALC_MS: u64 = 2000;
 
 fn mempool_state() -> &'static Arc<RwLock<InMemoryMempool>> {
     IN_MEMORY_MEMPOOL.get_or_init(|| Arc::new(RwLock::new(InMemoryMempool::default())))
@@ -2402,13 +2398,16 @@ fn recalculate_memory_templates() {
     //
     // We enforce a minimum interval between recalculations to reduce allocation
     // churn while still keeping templates reasonably up-to-date.
+    //
+    // Configurable via: mempool.template_recalc_ms in config.json (default: 2000ms)
     // =========================================================================
+    let cfg = get_config().mempool.clone();
     {
         let Ok(mut last_recalc) = last_template_recalc_time().lock() else {
             return;
         };
         let elapsed = last_recalc.elapsed();
-        if elapsed < Duration::from_millis(MIN_TEMPLATE_RECALC_MS) {
+        if elapsed < Duration::from_millis(cfg.template_recalc_ms) {
             // Too soon since last recalculation - skip this one
             return;
         }
@@ -2419,7 +2418,6 @@ fn recalculate_memory_templates() {
     let Ok(_recalculate_guard) = recalculate_templates_lock().try_lock() else {
         return;
     };
-    let cfg = get_config().mempool.clone();
     let next_height = crate::config::get_espo_next_height() as u64;
     let template_input = {
         let Ok(state) = mempool_state().read() else { return };

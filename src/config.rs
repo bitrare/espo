@@ -165,6 +165,13 @@ fn default_mempool_block_weight_units() -> u64 {
     4_000_000
 }
 
+/// Default minimum interval between template recalculations in milliseconds.
+/// This throttles the expensive cloning operations in recalculate_memory_templates()
+/// to prevent excessive memory allocation churn.
+fn default_mempool_template_recalc_ms() -> u64 {
+    2000
+}
+
 fn normalize_optional_string(value: Option<String>) -> Option<String> {
     value.map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
 }
@@ -243,6 +250,10 @@ pub struct MempoolConfig {
     pub template_blocks: usize,
     #[serde(default = "default_mempool_block_weight_units")]
     pub block_weight_units: u64,
+    /// Minimum interval between template recalculations in milliseconds.
+    /// Throttles expensive cloning operations to prevent memory growth.
+    #[serde(default = "default_mempool_template_recalc_ms")]
+    pub template_recalc_ms: u64,
     #[serde(default)]
     pub zmq_rawtx_url: Option<String>,
     #[serde(default)]
@@ -265,6 +276,7 @@ impl Default for MempoolConfig {
             max_txs: default_mempool_max_txs(),
             template_blocks: default_mempool_template_blocks(),
             block_weight_units: default_mempool_block_weight_units(),
+            template_recalc_ms: default_mempool_template_recalc_ms(),
             zmq_rawtx_url: None,
             zmq_sequence_url: None,
             websocket_enabled: false,

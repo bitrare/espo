@@ -6118,6 +6118,13 @@ impl EssentialsProvider {
             .max(1)
             .min(MAX_PAGE_LIMIT as u64) as usize;
         let only_alkane_txs = params.only_alkane_txs.unwrap_or(true);
+        
+        // Parse filter alkane if provided (e.g. "2:26180")
+        let filter_alkane: Option<SchemaAlkaneId> = params
+            .filter
+            .as_deref()
+            .and_then(parse_alkane_from_str);
+        
         let network = get_network();
         let page_offset = page.saturating_sub(1).try_into().unwrap_or(usize::MAX);
         let off = limit.saturating_mul(page_offset);
@@ -6346,10 +6353,31 @@ impl EssentialsProvider {
             }
         }
 
-        let transactions: Vec<Value> = tx_renders
+        // Apply alkane filter if specified (post-filter on results)
+        let filtered_renders: Vec<&AddressTxRender> = if let Some(ref filter_alk) = filter_alkane {
+            tx_renders
+                .iter()
+                .filter(|render| {
+                    // Check if any outflow entry involves the filter alkane
+                    render.summary.as_ref().map_or(false, |s| {
+                        s.outflows.iter().any(|entry| entry.outflow.contains_key(filter_alk))
+                    })
+                })
+                .collect()
+        } else {
+            tx_renders.iter().collect()
+        };
+
+        let transactions: Vec<Value> = filtered_renders
             .iter()
             .map(|render| enriched_transaction_json(render, &prev_map, network))
             .collect();
+
+        let filtered_total = if filter_alkane.is_some() {
+            transactions.len() // When filtered, total = actual count
+        } else {
+            tx_total
+        };
 
         Ok(RpcGetAddressTransactionsResult {
             value: json!({
@@ -6357,8 +6385,8 @@ impl EssentialsProvider {
                 "address": address,
                 "page": page,
                 "limit": limit,
-                "total": tx_total,
-                "has_more": (off + tx_renders.len()) < tx_total,
+                "total": filtered_total,
+                "has_more": if filter_alkane.is_some() { false } else { (off + tx_renders.len()) < tx_total },
                 "transactions": transactions,
             }),
         })
@@ -7131,6 +7159,8 @@ pub struct RpcGetAddressTransactionsParams {
     pub page: Option<u64>,
     pub limit: Option<u64>,
     pub only_alkane_txs: Option<bool>,
+    /// Filter results to only transactions involving this specific alkane (e.g. "2:26180")
+    pub filter: Option<String>,
 }
 
 pub struct RpcGetAddressTransactionsResult {

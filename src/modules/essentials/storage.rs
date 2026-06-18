@@ -9093,7 +9093,7 @@ fn protostone_to_value(protostone: &Protostone) -> Value {
                     "block": edict.id.block,
                     "tx": edict.id.tx,
                 },
-                "amount": edict.amount,
+                "amount": edict.amount.to_string(),  // u128 must be string for JSON safety
                 "output": edict.output,
             })
         })
@@ -9104,7 +9104,7 @@ fn protostone_to_value(protostone: &Protostone) -> Value {
         "edicts": edicts,
         "refund": protostone.refund,
         "pointer": protostone.pointer,
-        "from": protostone.from,
+        "from": protostone.from.map(|f| f.to_string()),  // Also convert u128 from field
         "protocol_tag": protostone.protocol_tag,
     })
 }

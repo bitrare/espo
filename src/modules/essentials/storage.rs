@@ -6354,34 +6354,39 @@ impl EssentialsProvider {
         }
 
         // Apply alkane filter if specified (post-filter on results)
-        let filter_alk_str = filter_alkane.as_ref().map(|a| format!("{}:{}", a.block, a.tx));
-        let filtered_renders: Vec<&AddressTxRender> = if let Some(ref filter_str) = filter_alk_str {
+        let filtered_renders: Vec<&AddressTxRender> = if let Some(ref filter_alk) = filter_alkane {
             tx_renders
                 .iter()
                 .filter(|render| {
-                    // Check traces for the filter alkane
                     render.summary.as_ref().map_or(false, |s| {
+                        // Check outflows (balance changes) - this captures simple transfers
+                        let has_outflow = s.outflows.iter().any(|entry| {
+                            entry.outflow.contains_key(filter_alk)
+                        });
+                        if has_outflow {
+                            return true;
+                        }
+                        
+                        // Also check traces for contract interactions
+                        let filter_str = format!("{}:{}", filter_alk.block, filter_alk.tx);
                         s.traces.iter().any(|trace| {
                             trace.events.iter().any(|event| {
                                 match event {
                                     crate::alkanes::trace::EspoSandshrewLikeTraceEvent::Invoke(data) => {
-                                        // Check incoming_alkanes
                                         data.context.incoming_alkanes.iter().any(|transfer| {
                                             let id_str = format!("{}:{}", transfer.id.block, transfer.id.tx);
-                                            &id_str == filter_str
+                                            id_str == filter_str
                                         })
                                     }
                                     crate::alkanes::trace::EspoSandshrewLikeTraceEvent::Return(data) => {
-                                        // Check response alkanes
                                         data.response.alkanes.iter().any(|transfer| {
                                             let id_str = format!("{}:{}", transfer.id.block, transfer.id.tx);
-                                            &id_str == filter_str
+                                            id_str == filter_str
                                         })
                                     }
                                     crate::alkanes::trace::EspoSandshrewLikeTraceEvent::Create(id) => {
-                                        // Check if created alkane matches
                                         let id_str = format!("{}:{}", id.block, id.tx);
-                                        &id_str == filter_str
+                                        id_str == filter_str
                                     }
                                 }
                             })

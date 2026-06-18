@@ -801,9 +801,29 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                                 .and_then(|v| v.as_str())
                                 .map(|s| s.to_string()),
                         };
-                        view.rpc_get_address_transactions(params)
-                            .map(|resp| resp.value)
-                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                        // Catch panics to prevent handler crashes and log details
+                        let addr_for_log = params.address.clone().unwrap_or_default();
+                        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            view.rpc_get_address_transactions(params)
+                        })) {
+                            Ok(result) => result
+                                .map(|resp| resp.value)
+                                .unwrap_or_else(|e| {
+                                    eprintln!("[get_address_transactions] Error for {}: {:?}", addr_for_log, e);
+                                    json!({"ok": false, "error": "internal_error"})
+                                }),
+                            Err(panic_info) => {
+                                let msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                                    s.to_string()
+                                } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                                    s.clone()
+                                } else {
+                                    "unknown panic".to_string()
+                                };
+                                eprintln!("[get_address_transactions] PANIC for address {}: {}", addr_for_log, msg);
+                                json!({"ok": false, "error": "internal_panic", "detail": msg})
+                            }
+                        }
                     }
                 })
                 .await;

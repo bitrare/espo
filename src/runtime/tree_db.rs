@@ -348,6 +348,29 @@ impl VersionedTreeDb {
         self.db.write(wb)
     }
 
+    /// Maintenance helper: after writing directly to the active root outside of
+    /// a block context (e.g. a one-off balance correction via `set_batch`),
+    /// re-point the current tip block's stored root at the new active root.
+    ///
+    /// Without this, the next `begin_block` would base its working root on the
+    /// parent (tip) block's original stored root and silently rebuild away the
+    /// correction. This does not create a new block/version; it only rewrites
+    /// the tip block's root pointer to include the already-applied change.
+    pub fn reseal_active_block_root(&self) -> anyhow::Result<()> {
+        let st = self.state.read().expect("tree state poisoned");
+        if st.pinned_root.is_some() {
+            anyhow::bail!("cannot reseal active block root while a pinned root is active");
+        }
+        let Some(block_hash) = st.active_block else {
+            anyhow::bail!("cannot reseal active block root: no active block");
+        };
+        let root = st.active_root;
+        let mut wb = WriteBatch::default();
+        wb.put(block_root_key(&block_hash), root);
+        self.db.write(wb)?;
+        Ok(())
+    }
+
     pub fn rewind_to_height(&self, target_height: Option<u32>) -> anyhow::Result<()> {
         let (active_root, active_block) = match target_height {
             Some(height) => {

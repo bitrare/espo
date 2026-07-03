@@ -1139,6 +1139,56 @@ async fn main() -> Result<()> {
     }
     // mods.register_module(TracesData::new());
 
+    // One-off maintenance: apply a manual balance correction and exit. This
+    // runs after modules are registered (so the DB/tree are initialized) but
+    // before the indexer/servers start. It must be run while the indexer is
+    // stopped and synced to the tip.
+    if let Some(fix) = config::manual_balance_fix_from_cli()? {
+        if view_only {
+            anyhow::bail!("--fix-balance-* cannot be used with --view-only");
+        }
+        let (blk, txp) = fix.alkane.split_once(':').ok_or_else(|| {
+            anyhow::anyhow!("invalid --fix-balance-alkane '{}': expected BLOCK:TX", fix.alkane)
+        })?;
+        let alkane = crate::schemas::SchemaAlkaneId {
+            block: blk
+                .trim()
+                .parse()
+                .map_err(|e| anyhow::anyhow!("invalid alkane block in '{}': {e}", fix.alkane))?,
+            tx: txp
+                .trim()
+                .parse()
+                .map_err(|e| anyhow::anyhow!("invalid alkane tx in '{}': {e}", fix.alkane))?,
+        };
+        let provider = crate::modules::essentials::storage::EssentialsProvider::new(
+            std::sync::Arc::new(Mdb::from_db(get_espo_db(), b"essentials:")),
+        );
+        eprintln!(
+            "[fix-balance] applying: alkane={} address={} subtract={}",
+            fix.alkane, fix.address, fix.amount
+        );
+        let report = crate::modules::essentials::utils::balances::manual_subtract_address_balance(
+            &provider,
+            alkane,
+            &fix.address,
+            fix.amount,
+        )?;
+        eprintln!(
+            "[fix-balance] done: address_balance {} -> {}, holder_balance {} -> {}, holders_count {} -> {}, circulating_supply {} -> {} (removed_holder={})",
+            report.prev_balance,
+            report.new_balance,
+            report.prev_holder_balance,
+            report.new_holder_balance,
+            report.prev_holders_count,
+            report.new_holders_count,
+            report.prev_supply,
+            report.new_supply,
+            report.removed_holder,
+        );
+        eprintln!("[fix-balance] correction committed; exiting. Restart espo normally to resume indexing.");
+        return Ok(());
+    }
+
     // Decide initial start height (resume at last+1 per module)
     let mut start_height = module_resume_start_height(&mods, network);
     let forced_start = std::env::var("ESPO_START_BLOCK")

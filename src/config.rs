@@ -548,6 +548,47 @@ pub struct CliArgs {
     /// On startup only, rewind indexed state so indexing resumes at this height.
     #[arg(long)]
     pub rollback: Option<u32>,
+
+    /// Maintenance: subtract `--fix-balance-amount` (raw base units) from a
+    /// single (address, alkane) balance and reconcile the derived holder entry,
+    /// holders count and latest circulating supply, then exit. The alkane is
+    /// given as BLOCK:TX. Must be provided together with --fix-balance-address
+    /// and --fix-balance-amount.
+    #[arg(long)]
+    pub fix_balance_alkane: Option<String>,
+
+    /// Maintenance: address whose balance should be corrected (see
+    /// --fix-balance-alkane).
+    #[arg(long)]
+    pub fix_balance_address: Option<String>,
+
+    /// Maintenance: raw base-unit amount to subtract (see --fix-balance-alkane).
+    #[arg(long)]
+    pub fix_balance_amount: Option<u128>,
+}
+
+/// Parsed maintenance request produced from the `--fix-balance-*` CLI flags.
+#[derive(Debug, Clone)]
+pub struct ManualBalanceFixArgs {
+    /// Alkane id as `BLOCK:TX`.
+    pub alkane: String,
+    pub address: String,
+    pub amount: u128,
+}
+
+/// Returns the one-off manual balance fix requested via CLI, if any. Errors if
+/// the flags are only partially provided.
+pub fn manual_balance_fix_from_cli() -> Result<Option<ManualBalanceFixArgs>> {
+    let cli = CliArgs::parse();
+    match (cli.fix_balance_alkane, cli.fix_balance_address, cli.fix_balance_amount) {
+        (None, None, None) => Ok(None),
+        (Some(alkane), Some(address), Some(amount)) => {
+            Ok(Some(ManualBalanceFixArgs { alkane, address, amount }))
+        }
+        _ => anyhow::bail!(
+            "--fix-balance-alkane, --fix-balance-address and --fix-balance-amount must all be provided together"
+        ),
+    }
 }
 
 fn load_config_file(path: &str) -> Result<ConfigFile> {

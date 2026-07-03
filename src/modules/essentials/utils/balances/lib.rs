@@ -3102,6 +3102,208 @@ pub fn bulk_update_balances_for_block(
     bulk_update_balances_for_block_with_factory_hints(provider, block, &HashMap::new())
 }
 
+/// Outcome of a [`manual_subtract_address_balance`] correction.
+#[derive(Debug, Clone)]
+pub struct ManualBalanceFixReport {
+    pub prev_balance: u128,
+    pub new_balance: u128,
+    pub prev_holder_balance: u128,
+    pub new_holder_balance: u128,
+    pub prev_holders_count: u64,
+    pub new_holders_count: u64,
+    pub prev_supply: u128,
+    pub new_supply: u128,
+    pub removed_holder: bool,
+}
+
+/// One-off maintenance fix: subtract `amount` (raw base units) from a single
+/// (`address`, `alkane`) balance and reconcile the derived state that the
+/// explorer/RPC reads: the holder entry, the address' token list, the holders
+/// count, the holders-ordered ranking index, and the latest circulating supply.
+///
+/// This mirrors the exact write semantics the block indexer uses (see
+/// `bulk_update_balances_for_block_with_factory_hints`, sections B and E), then
+/// commits to the active tree root and re-seals the current tip block's root so
+/// continued indexing keeps the correction instead of rebuilding it away.
+///
+/// Only the *latest* state is corrected; per-height historical snapshots
+/// (`circulating_supply_key` at past heights) are intentionally left untouched.
+/// Must be run while the indexer is stopped and at the tip.
+pub fn manual_subtract_address_balance(
+    provider: &EssentialsProvider,
+    alkane: SchemaAlkaneId,
+    address: &str,
+    amount: u128,
+) -> Result<ManualBalanceFixReport> {
+    if amount == 0 {
+        anyhow::bail!("manual balance fix: amount must be greater than zero");
+    }
+    let table = provider.table();
+    let read_u128 = |key: Vec<u8>| -> Result<u128> {
+        Ok(provider
+            .get_raw_value(GetRawValueParams { blockhash: StateAt::Latest, key })?
+            .value
+            .as_ref()
+            .and_then(|raw| decode_u128_value(raw).ok())
+            .unwrap_or(0))
+    };
+
+    let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut deletes: Vec<Vec<u8>> = Vec::new();
+
+    // 1) Address/token balance.
+    let bal_key = table.address_balance_key(address, &alkane);
+    let prev_balance = read_u128(bal_key.clone())?;
+    if amount > prev_balance {
+        anyhow::bail!(
+            "manual balance fix: refusing to subtract {amount} from address balance {prev_balance} (addr={address}, alkane={}:{})",
+            alkane.block,
+            alkane.tx
+        );
+    }
+    let new_balance = prev_balance - amount;
+    puts.push((bal_key, encode_u128_value(new_balance)?));
+
+    // 2) When the token drops to zero, rebuild the address' token list without
+    //    it (mirrors the indexer's full-rebuild path that drops zero balances).
+    if prev_balance > 0 && new_balance == 0 {
+        let len = provider
+            .get_raw_value(GetRawValueParams {
+                blockhash: StateAt::Latest,
+                key: table.address_balance_list_len_key(address),
+            })?
+            .value
+            .and_then(|bytes| {
+                if bytes.len() == 4 {
+                    let mut arr = [0u8; 4];
+                    arr.copy_from_slice(&bytes);
+                    Some(u32::from_le_bytes(arr))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+
+        let mut existing_tokens: Vec<SchemaAlkaneId> = Vec::new();
+        for idx in 0..len {
+            if let Some(raw) = provider
+                .get_raw_value(GetRawValueParams {
+                    blockhash: StateAt::Latest,
+                    key: table.address_balance_list_idx_key(address, idx),
+                })?
+                .value
+            {
+                if raw.len() == 12 {
+                    existing_tokens.push(SchemaAlkaneId {
+                        block: u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]),
+                        tx: u64::from_be_bytes([
+                            raw[4], raw[5], raw[6], raw[7], raw[8], raw[9], raw[10], raw[11],
+                        ]),
+                    });
+                }
+            }
+        }
+
+        let mut final_tokens: Vec<SchemaAlkaneId> = Vec::new();
+        for token in existing_tokens {
+            if token == alkane {
+                continue;
+            }
+            if read_u128(table.address_balance_key(address, &token))? > 0 {
+                final_tokens.push(token);
+            }
+        }
+        final_tokens.sort();
+        let new_len = final_tokens.len() as u32;
+        puts.push((
+            table.address_balance_list_len_key(address),
+            new_len.to_le_bytes().to_vec(),
+        ));
+        for (idx, token) in final_tokens.iter().enumerate() {
+            let mut token_bytes = Vec::with_capacity(12);
+            token_bytes.extend_from_slice(&token.block.to_be_bytes());
+            token_bytes.extend_from_slice(&token.tx.to_be_bytes());
+            puts.push((table.address_balance_list_idx_key(address, idx as u32), token_bytes));
+        }
+        for idx in new_len..len {
+            deletes.push(table.address_balance_list_idx_key(address, idx));
+        }
+    }
+
+    // 3) Holder entry (address holders mirror the address/token balance).
+    let holder = HolderId::Address(address.to_string());
+    let holder_key = table.holder_key(&alkane, &holder);
+    let prev_holder_balance = read_u128(holder_key.clone())?;
+    if amount > prev_holder_balance {
+        anyhow::bail!(
+            "manual balance fix: refusing to subtract {amount} from holder balance {prev_holder_balance} (addr={address}, alkane={}:{})",
+            alkane.block,
+            alkane.tx
+        );
+    }
+    let new_holder_balance = prev_holder_balance - amount;
+    puts.push((holder_key, encode_u128_value(new_holder_balance)?));
+
+    // 4) Holders count + ordered ranking index, only when the holder is fully
+    //    removed (balance reaches zero).
+    let count_key = table.holders_count_key(&alkane);
+    let prev_holders_count = provider
+        .get_raw_value(GetRawValueParams { blockhash: StateAt::Latest, key: count_key.clone() })?
+        .value
+        .and_then(|raw| HoldersCountEntry::try_from_slice(&raw).ok())
+        .map(|entry| entry.count)
+        .unwrap_or(0);
+    let mut new_holders_count = prev_holders_count;
+    let mut removed_holder = false;
+    if prev_holder_balance > 0 && new_holder_balance == 0 {
+        new_holders_count = prev_holders_count.saturating_sub(1);
+        removed_holder = true;
+        if prev_holders_count != new_holders_count {
+            deletes.push(table.alkane_holders_ordered_key(prev_holders_count, &alkane));
+            puts.push((table.alkane_holders_ordered_key(new_holders_count, &alkane), Vec::new()));
+        }
+        puts.push((count_key, get_holders_count_encoded(new_holders_count)?));
+    }
+
+    // 5) Latest circulating supply.
+    let supply_key = table.circulating_supply_latest_key(&alkane);
+    let prev_supply = read_u128(supply_key.clone())?;
+    if amount > prev_supply {
+        anyhow::bail!(
+            "manual balance fix: refusing to subtract {amount} from circulating supply {prev_supply} (alkane={}:{})",
+            alkane.block,
+            alkane.tx
+        );
+    }
+    let new_supply = prev_supply - amount;
+    puts.push((supply_key, encode_u128_value(new_supply)?));
+
+    // Commit to the active root, then re-seal the tip block's stored root so
+    // that the next begin_block picks up the correction rather than rebuilding
+    // from the parent block's original root.
+    provider.set_batch(SetBatchParams { blockhash: StateAt::Latest, puts, deletes })?;
+    match crate::runtime::tree_db::get_global_tree_db() {
+        Some(tree) => tree
+            .reseal_active_block_root()
+            .context("failed to re-seal tip block root after manual balance fix")?,
+        None => anyhow::bail!(
+            "manual balance fix: versioned tree unavailable; cannot persist correction durably"
+        ),
+    }
+
+    Ok(ManualBalanceFixReport {
+        prev_balance,
+        new_balance,
+        prev_holder_balance,
+        new_holder_balance,
+        prev_holders_count,
+        new_holders_count,
+        prev_supply,
+        new_supply,
+        removed_holder,
+    })
+}
+
 #[allow(unused_assignments)]
 pub fn bulk_update_balances_for_block_with_factory_hints(
     provider: &EssentialsProvider,

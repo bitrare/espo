@@ -320,6 +320,46 @@ impl VersionedTreeDb {
         self.db.write(wb)
     }
 
+    /// Rewind the canonical (active) tree state so that reads reflect the state
+    /// as of `target_height`. This resets the active root/block pointers to the
+    /// stored root of the block at `target_height`, discarding any state that was
+    /// accumulated at higher heights. Because nodes are content-addressed and
+    /// blocks branch from their parent's root, re-indexing forward from
+    /// `target_height + 1` transparently rebuilds canonical state on top of this
+    /// root. Historical/abandoned nodes are left in place (harmless, immutable).
+    ///
+    /// Returns the block hash the active pointer was reset to, or `None` when no
+    /// block root is stored for `target_height` (e.g. below the first indexed
+    /// height).
+    pub fn rewind_active_to_height(
+        &self,
+        target_height: u32,
+    ) -> Result<Option<BlockHash>, RocksError> {
+        let Some(block_hash) = self.blockhash_for_height(target_height)? else {
+            return Ok(None);
+        };
+        let Some(root) = self.root_for_blockhash(&block_hash)? else {
+            return Ok(None);
+        };
+        let hash_bytes = block_hash.to_byte_array();
+
+        let mut st = self.state.write().expect("tree state poisoned");
+        st.current_block = None;
+        st.active_root = root;
+        st.active_block = Some(hash_bytes);
+        st.pinned_root = None;
+        st.pin_until_height = None;
+
+        let mut wb = WriteBatch::default();
+        wb.put(META_ACTIVE_ROOT, root);
+        wb.put(META_ACTIVE_BLOCK, hash_bytes);
+        wb.delete(META_PINNED_ROOT);
+        wb.delete(META_PIN_UNTIL_HEIGHT);
+        self.db.write(wb)?;
+
+        Ok(Some(block_hash))
+    }
+
     pub fn pin_active_root_until_height(&self, until_height: u32) -> Result<(), RocksError> {
         let mut st = self.state.write().expect("tree state poisoned");
         st.pinned_root = Some(st.active_root);

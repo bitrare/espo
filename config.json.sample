@@ -33,6 +33,7 @@
   },
   "network": "mainnet",
   "metashrew_db_label": null,
+  "rollback": null,
   "strict_mode": {
     "check_utxos": false,
     "check_alkane_balances": false,

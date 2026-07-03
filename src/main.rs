@@ -887,6 +887,59 @@ async fn main() -> Result<()> {
     }
     let metashrew_sdb = get_metashrew_sdb();
 
+    // --- Optional startup rollback (rewind indexed state to a chosen height) ---
+    // This MUST run before modules are constructed so their in-memory caches load
+    // the rewound state. Versioned modules (essentials/ammdata/tokendata/subfrost/
+    // pizzafun/oylapi) all read through the COW tree's active root, so resetting
+    // that root rewinds them atomically. Unversioned modules (runes) are rewound
+    // through their reorg hook once the registry is built (see below).
+    let rollback_replay_from: Option<u32> = if let Some(target) = cfg.rollback {
+        if view_only {
+            anyhow::bail!("rollback cannot be combined with --view-only");
+        }
+        if std::env::var("ESPO_START_BLOCK").is_ok() {
+            anyhow::bail!("rollback cannot be combined with ESPO_START_BLOCK");
+        }
+        let tree = get_global_tree_db()
+            .ok_or_else(|| anyhow::anyhow!("rollback requested but tree db is not initialized"))?;
+        let current_tip = tree
+            .indexed_height_bounds()
+            .context("failed to read indexed height bounds for rollback")?
+            .map(|(_, last)| last);
+        match current_tip {
+            None => {
+                eprintln!("[startup_rollback] no indexed blocks found; nothing to roll back");
+                None
+            }
+            Some(tip) if target >= tip => {
+                eprintln!(
+                    "[startup_rollback] requested rollback height {target} >= current indexed tip {tip}; nothing to roll back"
+                );
+                None
+            }
+            Some(tip) => {
+                eprintln!(
+                    "[startup_rollback] rewinding indexed state from tip {tip} to {target}; indexer will resume at {}",
+                    target.saturating_add(1)
+                );
+                let hash = tree
+                    .rewind_active_to_height(target)
+                    .context("failed to rewind tree active root")?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "no stored block root for height {target}; cannot roll back (is it below the first indexed height?)"
+                        )
+                    })?;
+                eprintln!(
+                    "[startup_rollback] tree active root reset to block {hash} at height {target}"
+                );
+                Some(target.saturating_add(1))
+            }
+        }
+    } else {
+        None
+    };
+
     // Build module registry with the global ESPO DB
     let mut mods = ModuleRegistry::with_db(get_espo_db());
     // Essentials must run before any optional modules.
@@ -914,6 +967,20 @@ async fn main() -> Result<()> {
         eprintln!("[modules] oylapi disabled (missing config)");
     }
     // mods.register_module(TracesData::new());
+
+    // Finish the startup rollback for unversioned modules (runes rewinds through
+    // its undo journal) and drop mempool state, before any server is exposed.
+    if let Some(replay_from) = rollback_replay_from {
+        for m in mods.modules() {
+            m.handle_reorg(replay_from).with_context(|| {
+                format!("module {} failed to roll back to height {replay_from}", m.get_name())
+            })?;
+        }
+        if let Err(e) = reset_mempool_store() {
+            eprintln!("[startup_rollback] failed to reset mempool store: {e:?}");
+        }
+        eprintln!("[startup_rollback] rollback complete; indexer will resume at {replay_from}");
+    }
 
     let essentials_mdb = Mdb::from_db(get_espo_db(), b"essentials:");
     let loaded = preload_block_summary_cache(&essentials_mdb);
@@ -956,6 +1023,11 @@ async fn main() -> Result<()> {
         })
         .min()
         .unwrap_or_else(|| alkanes_genesis_block(network));
+    // A startup rollback forces the resume height to `rollback + 1`, overriding the
+    // per-module resume computation above.
+    if let Some(replay_from) = rollback_replay_from {
+        start_height = replay_from;
+    }
     if let Some(forced_start) = std::env::var("ESPO_START_BLOCK")
         .ok()
         .and_then(|value| value.parse::<u32>().ok())

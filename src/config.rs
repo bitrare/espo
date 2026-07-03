@@ -362,6 +362,10 @@ pub struct ConfigFile {
     pub metashrew_db_label: Option<String>,
     #[serde(default)]
     pub strict_mode: Option<StrictModeConfig>,
+    /// Roll back indexed state to this height on startup, then resume indexing
+    /// from `rollback + 1`. Overridden by the `--rollback` CLI flag.
+    #[serde(default)]
+    pub rollback: Option<u32>,
     #[serde(default)]
     pub debug: bool,
     #[serde(default)]
@@ -411,6 +415,9 @@ pub struct AppConfig {
     pub network: Network,
     pub metashrew_db_label: Option<String>,
     pub strict_mode: Option<StrictModeConfig>,
+    /// Roll back indexed state to this height on startup, then resume indexing
+    /// from `rollback + 1`. Set via config file or the `--rollback` CLI flag.
+    pub rollback: Option<u32>,
     pub debug: bool,
     pub debug_ignore_ms: u64,
     pub debug_backup: Option<DebugBackupConfig>,
@@ -435,6 +442,12 @@ pub struct CliArgs {
     /// Serve existing data without running the indexer or mempool service.
     #[arg(long, default_value_t = false)]
     pub view_only: bool,
+
+    /// Roll back indexed state to this height on startup, then resume indexing
+    /// from `rollback + 1`. Overrides the config file. Cannot be combined with
+    /// --view-only or the ESPO_START_BLOCK env var.
+    #[arg(long)]
+    pub rollback: Option<u32>,
 }
 
 fn load_config_file(path: &str) -> Result<ConfigFile> {
@@ -480,6 +493,7 @@ impl AppConfig {
             network,
             metashrew_db_label: normalize_optional_string(file.metashrew_db_label),
             strict_mode: file.strict_mode,
+            rollback: file.rollback,
             debug: file.debug,
             debug_ignore_ms: file.debug_ignore_ms,
             debug_backup,
@@ -661,7 +675,11 @@ fn init_config_from_inner(cfg: AppConfig, espo_read_only: bool) -> Result<()> {
 
 pub fn init_config() -> Result<()> {
     let cli = CliArgs::parse();
-    let cfg = load_config_from_path(&cli.config_path, cli.view_only)?;
+    let mut cfg = load_config_from_path(&cli.config_path, cli.view_only)?;
+    // CLI --rollback overrides any value from the config file.
+    if cli.rollback.is_some() {
+        cfg.rollback = cli.rollback;
+    }
     init_config_from(cfg)
 }
 

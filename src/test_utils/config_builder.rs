@@ -43,6 +43,7 @@ impl TestConfigBuilder {
             network: Network::Regtest, // Default to regtest
             metashrew_db_label: None,
             strict_mode: None,
+            rollback: None,
             debug: false,
             debug_ignore_ms: 0,
             debug_backup: None,

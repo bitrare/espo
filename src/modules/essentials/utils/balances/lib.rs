@@ -571,15 +571,21 @@ pub(crate) fn accumulate_alkane_balance_deltas(
                 }
 
                 // Outgoing: transfer from this frame's owner -> nearest normal parent.
+                // A root return has no alkane parent. Its returned alkanes are only a trace
+                // response unless the protostone/output projection persists them separately.
+                // Creating a negative-only owner delta here makes quote/probe style root calls
+                // look like spends and can underflow the contract balance on replay.
                 let outgoing = transfers_to_sheet(&ret.response.alkanes);
-                for (token, amount) in &outgoing {
-                    apply_transfer(
-                        &mut frame.deltas,
-                        Some(frame.owner),
-                        frame.parent_normal,
-                        *token,
-                        *amount,
-                    );
+                if frame.parent_normal.is_some() {
+                    for (token, amount) in &outgoing {
+                        apply_transfer(
+                            &mut frame.deltas,
+                            Some(frame.owner),
+                            frame.parent_normal,
+                            *token,
+                            *amount,
+                        );
+                    }
                 }
 
                 // Merge this frame's (successful) subtree effects upward.

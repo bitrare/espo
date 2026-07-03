@@ -22,6 +22,10 @@ pub mod schemas;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod utils;
 
+#[cfg(all(not(target_arch = "wasm32"), feature = "jemalloc-prof"))]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use std::net::SocketAddr;
 use std::path::Path;
 use std::process::Command;
@@ -190,6 +194,130 @@ fn log_canonicality_wait(
     );
 }
 
+fn set_rewind_target(rewind_target: &AtomicU32, divergence_height: u32) -> bool {
+    let mut current = rewind_target.load(Ordering::Relaxed);
+    while divergence_height < current {
+        match rewind_target.compare_exchange(
+            current,
+            divergence_height,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => return true,
+            Err(observed) => current = observed,
+        }
+    }
+    false
+}
+
+fn rewind_tree_to_before(next_height: u32) -> Result<()> {
+    let Some(tree) = get_global_tree_db() else {
+        return Ok(());
+    };
+
+    let target_height = match next_height.checked_sub(1) {
+        Some(parent_height) => match tree.indexed_height_bounds()? {
+            Some((first_height, _)) if parent_height >= first_height => Some(parent_height),
+            _ => None,
+        },
+        None => None,
+    };
+
+    tree.rewind_to_height(target_height)
+        .with_context(|| format!("failed to rewind versioned tree before height {next_height}"))?;
+    Ok(())
+}
+
+fn handle_reorg_switch(mods: &ModuleRegistry, next_height: u32) -> Result<()> {
+    for m in mods.modules() {
+        m.preflight_reorg(next_height).with_context(|| {
+            format!("module {} cannot roll back to height {next_height}", m.get_name())
+        })?;
+    }
+    rewind_tree_to_before(next_height)?;
+    for m in mods.modules() {
+        m.handle_reorg(next_height).with_context(|| {
+            format!("module {} failed to handle reorg to height {next_height}", m.get_name())
+        })?;
+    }
+    for m in mods.modules() {
+        let Some(height) = m.get_index_height() else {
+            continue;
+        };
+        if height >= next_height {
+            anyhow::bail!(
+                "module {} still reports index height {} after reorg to next_height {}",
+                m.get_name(),
+                height,
+                next_height
+            );
+        }
+    }
+    Ok(())
+}
+
+fn module_resume_start_height(mods: &ModuleRegistry, network: bitcoin::Network) -> u32 {
+    mods.modules()
+        .iter()
+        .map(|m| {
+            let g = m.get_genesis_block(network);
+            match m.get_index_height() {
+                Some(h) => h.saturating_add(1).max(g),
+                None => g,
+            }
+        })
+        .min()
+        .unwrap_or_else(|| alkanes_genesis_block(network))
+}
+
+fn apply_startup_rollback(
+    mods: &ModuleRegistry,
+    requested_tip_height: u32,
+    resume_start_height: u32,
+    view_only: bool,
+) -> Result<u32> {
+    if view_only {
+        anyhow::bail!("rollback cannot be used with --view-only");
+    }
+    let current_tip_height = resume_start_height.saturating_sub(1);
+    if requested_tip_height > current_tip_height {
+        anyhow::bail!(
+            "rollback height {requested_tip_height} is ahead of the current indexed tip {current_tip_height}; refusing to skip indexed state"
+        );
+    }
+    let replay_start_height = requested_tip_height
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("rollback height {requested_tip_height} overflows"))?;
+    if replay_start_height == resume_start_height {
+        eprintln!(
+            "[startup_rollback] requested tip {} already matches current indexed tip {}; no rollback needed",
+            requested_tip_height, current_tip_height
+        );
+        return Ok(resume_start_height);
+    }
+
+    eprintln!(
+        "[startup_rollback] rewinding indexed state from current tip {} to {}; indexer will resume at {}",
+        current_tip_height, requested_tip_height, replay_start_height
+    );
+    handle_reorg_switch(mods, replay_start_height)?;
+    if let Err(e) = reset_mempool_store() {
+        eprintln!("[mempool] failed to reset store after startup rollback: {e:?}");
+    }
+    eprintln!(
+        "[startup_rollback] rollback complete; retained tip {}; indexer will resume at {}",
+        requested_tip_height, replay_start_height
+    );
+    Ok(replay_start_height)
+}
+
+fn rollback_failed_block(mods: &ModuleRegistry, next_height: u32) -> Result<()> {
+    if let Some(tree) = get_global_tree_db() {
+        tree.abort_block();
+    }
+    handle_reorg_switch(mods, next_height)
+}
+
 fn run_debug_backup(db_path: &str, backup: &DebugBackupConfig, block: u32) -> std::io::Result<()> {
     let db_root = Path::new(db_path);
     let backup_root = Path::new(&backup.dir);
@@ -274,11 +402,11 @@ fn checkpoint_espo_db(dest_dir: &Path) -> std::io::Result<()> {
 
 fn detect_first_divergence_height(
     indexed_tip: u32,
-    safe_tip: u32,
+    active_tip: u32,
     genesis_height: u32,
 ) -> Option<u32> {
     let Some(tree) = get_global_tree_db() else { return None };
-    let check_tip = indexed_tip.min(safe_tip);
+    let check_tip = indexed_tip.min(active_tip);
     if check_tip < genesis_height {
         return None;
     }
@@ -315,6 +443,11 @@ fn detect_first_divergence_height(
     }
 }
 
+fn get_core_tip_height() -> Result<u32> {
+    let tip = get_bitcoind_rpc_client().get_block_count().context("bitcoind getblockcount")?;
+    u32::try_from(tip).context("bitcoind height does not fit in u32")
+}
+
 async fn run_reorg_poller(
     rewind_target: Arc<AtomicU32>,
     shutdown_requested: Arc<AtomicBool>,
@@ -327,46 +460,32 @@ async fn run_reorg_poller(
             break;
         }
 
-        let safe_tip = match get_safe_tip() {
+        match get_safe_tip() {
+            Ok(h) => update_safe_tip(h),
+            Err(e) => eprintln!("[reorg] failed to fetch safe tip: {e:?}"),
+        }
+        let core_tip = match get_core_tip_height() {
             Ok(h) => h,
             Err(e) => {
-                eprintln!("[reorg] failed to fetch safe tip: {e:?}");
+                eprintln!("[reorg] failed to fetch core tip: {e:?}");
                 tokio::time::sleep(REORG_POLL_INTERVAL).await;
                 continue;
             }
         };
-        update_safe_tip(safe_tip);
 
         let indexed_tip = ESPO_HEIGHT
             .get()
             .map(|h| h.load(Ordering::Relaxed).saturating_sub(1))
             .unwrap_or(genesis_height.saturating_sub(1));
 
-        if indexed_tip < safe_tip {
-            tokio::time::sleep(REORG_POLL_INTERVAL).await;
-            continue;
-        }
-
         if let Some(divergence_height) =
-            detect_first_divergence_height(indexed_tip, safe_tip, genesis_height)
+            detect_first_divergence_height(indexed_tip, core_tip, genesis_height)
         {
-            let mut current = rewind_target.load(Ordering::Relaxed);
-            while divergence_height < current {
-                match rewind_target.compare_exchange(
-                    current,
-                    divergence_height,
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
-                ) {
-                    Ok(_) => {
-                        eprintln!(
-                            "[reorg] detected divergence at height {} (indexed_tip={}, safe_tip={})",
-                            divergence_height, indexed_tip, safe_tip
-                        );
-                        break;
-                    }
-                    Err(observed) => current = observed,
-                }
+            if set_rewind_target(&rewind_target, divergence_height) {
+                eprintln!(
+                    "[reorg] detected divergence at height {} (indexed_tip={}, core_tip={})",
+                    divergence_height, indexed_tip, core_tip
+                );
             }
         }
 
@@ -585,17 +704,9 @@ async fn run_indexer_loop(
 
         let requested_rewind = rewind_target.swap(NO_REWIND, Ordering::SeqCst);
         if requested_rewind != NO_REWIND && requested_rewind < next_height {
-            for m in mods.modules() {
-                if let Err(e) = m.handle_reorg(requested_rewind) {
-                    eprintln!(
-                        "[module:{}] failed to handle reorg to height {}: {e:?}",
-                        m.get_name(),
-                        requested_rewind
-                    );
-                    shutdown_requested.store(true, Ordering::Relaxed);
-                }
-            }
-            if shutdown_requested.load(Ordering::Relaxed) {
+            if let Err(e) = handle_reorg_switch(&mods, requested_rewind) {
+                eprintln!("[reorg] failed to switch indexer to height {}: {e:?}", requested_rewind);
+                shutdown_requested.store(true, Ordering::Relaxed);
                 break;
             }
             next_height = requested_rewind;
@@ -639,6 +750,33 @@ async fn run_indexer_loop(
         };
         safe_tip_waits.reset();
         update_safe_tip(tip);
+        let core_tip = match get_core_tip_height() {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("[indexer] failed to fetch core tip for reorg check: {e:?}");
+                tokio::time::sleep(POLL_INTERVAL).await;
+                continue;
+            }
+        };
+
+        let indexed_tip = ESPO_HEIGHT
+            .get()
+            .map(|h| h.load(Ordering::Relaxed).saturating_sub(1))
+            .unwrap_or(genesis_height.saturating_sub(1));
+        if let Some(divergence_height) =
+            detect_first_divergence_height(indexed_tip, core_tip, genesis_height)
+        {
+            if divergence_height < next_height {
+                if set_rewind_target(&rewind_target, divergence_height) {
+                    eprintln!(
+                        "[reorg] detected divergence at height {} before indexing (indexed_tip={}, safe_tip={}, core_tip={})",
+                        divergence_height, indexed_tip, tip, core_tip
+                    );
+                }
+                continue;
+            }
+        }
+
         let target_tip = stop_after_block.unwrap_or(tip);
         if stop_after_block.is_some_and(|end| next_height > end) {
             eprintln!(
@@ -698,7 +836,6 @@ async fn run_indexer_loop(
             {
                 Ok(espo_block) => {
                     block_waits.reset();
-                    // (Optional) include hash or tx count here as you like
                     let block_txids: Vec<Txid> = espo_block
                         .transactions
                         .iter()
@@ -709,40 +846,154 @@ async fn run_indexer_loop(
                     let block_hash = espo_block.block_header.block_hash();
                     let db_write_guard = AtomicFlagGuard::new(&db_write_active);
 
+                    let mut block_failed: Option<anyhow::Error> = None;
+                    match get_bitcoind_rpc_client().get_block_hash(next_height as u64) {
+                        Ok(canonical_hash) if canonical_hash != block_hash => {
+                            block_failed = Some(anyhow::anyhow!(
+                                "block source returned non-canonical block at height {}: source={} core={}",
+                                next_height,
+                                block_hash,
+                                canonical_hash
+                            ));
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            block_failed = Some(anyhow::anyhow!(
+                                "failed to verify canonical block hash at height {}: {}",
+                                next_height,
+                                e
+                            ));
+                        }
+                    }
                     if let Some(tree) = get_global_tree_db() {
-                        if let Err(e) = tree.begin_block(
-                            next_height,
-                            &block_hash,
-                            &espo_block.block_header.prev_blockhash,
-                        ) {
-                            eprintln!(
-                                "[tree] failed to begin block {} ({}): {e:?}",
-                                next_height, block_hash
-                            );
+                        if block_failed.is_none() {
+                            if let Err(e) = tree.begin_block(
+                                next_height,
+                                &block_hash,
+                                &espo_block.block_header.prev_blockhash,
+                            ) {
+                                block_failed = Some(anyhow::anyhow!(
+                                    "tree failed to begin block {} ({}): {}",
+                                    next_height,
+                                    block_hash,
+                                    e
+                                ));
+                            }
                         }
                     }
 
                     let mut deferred_runes_module = None;
-                    for m in mods.modules() {
-                        if m.get_name() == "runes" {
-                            deferred_runes_module = Some(m.clone());
-                            continue;
-                        }
-                        if next_height >= m.get_genesis_block(network) {
-                            if let Err(e) = m.index_block(espo_block.clone()) {
-                                eprintln!(
-                                    "[module:{}] height {}: {e:?}",
-                                    m.get_name(),
-                                    next_height
-                                );
+                    if block_failed.is_none() {
+                        for m in mods.modules() {
+                            if m.get_name() == "runes" {
+                                deferred_runes_module = Some(m.clone());
+                                continue;
+                            }
+                            if next_height >= m.get_genesis_block(network) {
+                                if let Err(e) = m.index_block(espo_block.clone()) {
+                                    block_failed = Some(e.context(format!(
+                                        "module {} failed at height {}",
+                                        m.get_name(),
+                                        next_height
+                                    )));
+                                    break;
+                                }
                             }
                         }
                     }
+                    if let Some(e) = block_failed {
+                        if let Err(rollback_err) = rollback_failed_block(&mods, next_height) {
+                            eprintln!(
+                                "[indexer] failed to roll back block {} after error: {rollback_err:?}; original error: {e:?}",
+                                next_height
+                            );
+                            shutdown_requested.store(true, Ordering::Relaxed);
+                            break;
+                        }
+                        drop(db_write_guard);
+                        eprintln!(
+                            "[indexer] block {} failed before commit; rolled back and will retry: {e:?}",
+                            next_height
+                        );
+                        tokio::time::sleep(POLL_INTERVAL).await;
+                        continue;
+                    }
+
                     if let Err(e) = crate::debug::flush_timer_totals() {
                         eprintln!(
                             "[debug] failed to flush timer totals at height {}: {}",
                             next_height, e
                         );
+                    }
+
+                    if let Some(tree) = get_global_tree_db() {
+                        if let Err(e) = tree.finish_block() {
+                            if let Err(rollback_err) = rollback_failed_block(&mods, next_height) {
+                                eprintln!(
+                                    "[indexer] failed to roll back block {} after tree finish error: {rollback_err:?}; original error: {e:?}",
+                                    next_height
+                                );
+                                shutdown_requested.store(true, Ordering::Relaxed);
+                                break;
+                            }
+                            drop(db_write_guard);
+                            eprintln!(
+                                "[tree] failed to finish block {}; rolled back and will retry: {e:?}",
+                                next_height
+                            );
+                            tokio::time::sleep(POLL_INTERVAL).await;
+                            continue;
+                        }
+                    }
+
+                    if let Some(m) = deferred_runes_module {
+                        if next_height >= m.get_genesis_block(network) {
+                            if let Err(e) = m.index_block(espo_block.clone()) {
+                                eprintln!(
+                                    "[module:{}] height {} failed after tree commit: {e:?}",
+                                    m.get_name(),
+                                    next_height
+                                );
+                                if let Err(rollback_err) = rollback_failed_block(&mods, next_height)
+                                {
+                                    eprintln!(
+                                        "[indexer] failed to roll back block {} after runes error: {rollback_err:?}; original error: {e:?}",
+                                        next_height
+                                    );
+                                    shutdown_requested.store(true, Ordering::Relaxed);
+                                    break;
+                                }
+                                drop(db_write_guard);
+                                eprintln!(
+                                    "[indexer] block {} rolled back after runes error; retrying",
+                                    next_height
+                                );
+                                tokio::time::sleep(POLL_INTERVAL).await;
+                                continue;
+                            }
+                        }
+                    }
+
+                    if let Err(e) = update_indexed_block_interaction_summary(
+                        &essentials_provider,
+                        runes_summary_provider.as_ref(),
+                        &espo_block,
+                    ) {
+                        if let Err(rollback_err) = rollback_failed_block(&mods, next_height) {
+                            eprintln!(
+                                "[indexer] failed to roll back block {} after summary error: {rollback_err:?}; original error: {e:?}",
+                                next_height
+                            );
+                            shutdown_requested.store(true, Ordering::Relaxed);
+                            break;
+                        }
+                        drop(db_write_guard);
+                        eprintln!(
+                            "[summary] failed to update interaction count at height {}; rolled back and will retry: {e:?}",
+                            next_height
+                        );
+                        tokio::time::sleep(POLL_INTERVAL).await;
+                        continue;
                     }
 
                     match purge_confirmed_txids(&block_txids) {
@@ -758,34 +1009,6 @@ async fn run_indexer_loop(
                             "[mempool] failed to purge confirmed txs at height {}: {e:?}",
                             next_height
                         ),
-                    }
-                    if let Some(tree) = get_global_tree_db() {
-                        if let Err(e) = tree.finish_block() {
-                            eprintln!("[tree] failed to finish block {}: {e:?}", next_height);
-                        }
-                    }
-
-                    if let Some(m) = deferred_runes_module {
-                        if next_height >= m.get_genesis_block(network) {
-                            if let Err(e) = m.index_block(espo_block.clone()) {
-                                eprintln!(
-                                    "[module:{}] height {}: {e:?}",
-                                    m.get_name(),
-                                    next_height
-                                );
-                            }
-                        }
-                    }
-
-                    if let Err(e) = update_indexed_block_interaction_summary(
-                        &essentials_provider,
-                        runes_summary_provider.as_ref(),
-                        &espo_block,
-                    ) {
-                        eprintln!(
-                            "[summary] failed to update interaction count at height {}: {e:?}",
-                            next_height
-                        );
                     }
                     publish_new_block_event(next_height, &block_txids);
                     publish_confirmed_tx_events(next_height, &block_txids, &block_address_txs);
@@ -876,6 +1099,7 @@ async fn run_indexer_loop(
 async fn main() -> Result<()> {
     tokio::task::block_in_place(init_config)?;
     let cfg = get_config().clone();
+    let mut jemalloc_profiler = runtime::jemalloc_prof::start(&cfg.jemalloc_profile);
     let network = get_network();
     let view_only = cfg.view_only;
     tokio::task::block_in_place(init_block_source)?;
@@ -886,59 +1110,6 @@ async fn main() -> Result<()> {
         );
     }
     let metashrew_sdb = get_metashrew_sdb();
-
-    // --- Optional startup rollback (rewind indexed state to a chosen height) ---
-    // This MUST run before modules are constructed so their in-memory caches load
-    // the rewound state. Versioned modules (essentials/ammdata/tokendata/subfrost/
-    // pizzafun/oylapi) all read through the COW tree's active root, so resetting
-    // that root rewinds them atomically. Unversioned modules (runes) are rewound
-    // through their reorg hook once the registry is built (see below).
-    let rollback_replay_from: Option<u32> = if let Some(target) = cfg.rollback {
-        if view_only {
-            anyhow::bail!("rollback cannot be combined with --view-only");
-        }
-        if std::env::var("ESPO_START_BLOCK").is_ok() {
-            anyhow::bail!("rollback cannot be combined with ESPO_START_BLOCK");
-        }
-        let tree = get_global_tree_db()
-            .ok_or_else(|| anyhow::anyhow!("rollback requested but tree db is not initialized"))?;
-        let current_tip = tree
-            .indexed_height_bounds()
-            .context("failed to read indexed height bounds for rollback")?
-            .map(|(_, last)| last);
-        match current_tip {
-            None => {
-                eprintln!("[startup_rollback] no indexed blocks found; nothing to roll back");
-                None
-            }
-            Some(tip) if target >= tip => {
-                eprintln!(
-                    "[startup_rollback] requested rollback height {target} >= current indexed tip {tip}; nothing to roll back"
-                );
-                None
-            }
-            Some(tip) => {
-                eprintln!(
-                    "[startup_rollback] rewinding indexed state from tip {tip} to {target}; indexer will resume at {}",
-                    target.saturating_add(1)
-                );
-                let hash = tree
-                    .rewind_active_to_height(target)
-                    .context("failed to rewind tree active root")?
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "no stored block root for height {target}; cannot roll back (is it below the first indexed height?)"
-                        )
-                    })?;
-                eprintln!(
-                    "[startup_rollback] tree active root reset to block {hash} at height {target}"
-                );
-                Some(target.saturating_add(1))
-            }
-        }
-    } else {
-        None
-    };
 
     // Build module registry with the global ESPO DB
     let mut mods = ModuleRegistry::with_db(get_espo_db());
@@ -968,18 +1139,24 @@ async fn main() -> Result<()> {
     }
     // mods.register_module(TracesData::new());
 
-    // Finish the startup rollback for unversioned modules (runes rewinds through
-    // its undo journal) and drop mempool state, before any server is exposed.
-    if let Some(replay_from) = rollback_replay_from {
-        for m in mods.modules() {
-            m.handle_reorg(replay_from).with_context(|| {
-                format!("module {} failed to roll back to height {replay_from}", m.get_name())
-            })?;
-        }
-        if let Err(e) = reset_mempool_store() {
-            eprintln!("[startup_rollback] failed to reset mempool store: {e:?}");
-        }
-        eprintln!("[startup_rollback] rollback complete; indexer will resume at {replay_from}");
+    // Decide initial start height (resume at last+1 per module)
+    let mut start_height = module_resume_start_height(&mods, network);
+    let forced_start = std::env::var("ESPO_START_BLOCK")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok());
+    if cfg.rollback.is_some() && forced_start.is_some() {
+        anyhow::bail!(
+            "rollback cannot be combined with ESPO_START_BLOCK; use rollback for rollback"
+        );
+    }
+    if let Some(rollback_height) = cfg.rollback {
+        start_height = apply_startup_rollback(&mods, rollback_height, start_height, view_only)?;
+    }
+    if let Some(forced_start) = forced_start {
+        eprintln!(
+            "[indexer] forcing start block from ESPO_START_BLOCK={forced_start}; this does not rewind existing module state"
+        );
+        start_height = forced_start;
     }
 
     let essentials_mdb = Mdb::from_db(get_espo_db(), b"essentials:");
@@ -1010,32 +1187,6 @@ async fn main() -> Result<()> {
         eprintln!("[explorer] listening on {}", explorer_addr);
     }
 
-    // Decide initial start height (resume at last+1 per module)
-    let mut start_height = mods
-        .modules()
-        .iter()
-        .map(|m| {
-            let g = m.get_genesis_block(network);
-            match m.get_index_height() {
-                Some(h) => h.saturating_add(1).max(g),
-                None => g,
-            }
-        })
-        .min()
-        .unwrap_or_else(|| alkanes_genesis_block(network));
-    // A startup rollback forces the resume height to `rollback + 1`, overriding the
-    // per-module resume computation above.
-    if let Some(replay_from) = rollback_replay_from {
-        start_height = replay_from;
-    }
-    if let Some(forced_start) = std::env::var("ESPO_START_BLOCK")
-        .ok()
-        .and_then(|value| value.parse::<u32>().ok())
-    {
-        eprintln!("[indexer] forcing start block from ESPO_START_BLOCK={forced_start}");
-        start_height = forced_start;
-    }
-
     let height_cell = Arc::new(AtomicU32::new(start_height));
 
     ESPO_HEIGHT
@@ -1056,6 +1207,7 @@ async fn main() -> Result<()> {
         for handle in service_handles.drain(..) {
             handle.abort();
         }
+        jemalloc_profiler.shutdown_dump();
         return Ok(());
     }
 
@@ -1089,6 +1241,7 @@ async fn main() -> Result<()> {
                 eprintln!("[indexer] thread panicked: {err:?}");
                 std::process::abort();
             }
+            jemalloc_profiler.shutdown_dump();
             return Ok(());
         }
 
@@ -1115,6 +1268,7 @@ async fn main() -> Result<()> {
                 eprintln!("[indexer] thread panicked: {err:?}");
                 std::process::abort();
             }
+            jemalloc_profiler.shutdown_dump();
             return Ok(());
         }
 
@@ -1123,6 +1277,7 @@ async fn main() -> Result<()> {
             eprintln!(
                 "[PROCESS] forcing exit after shutdown grace; indexer is not in a db write section"
             );
+            jemalloc_profiler.shutdown_dump();
             std::process::exit(130);
         }
         if db_active && !logged_db_wait {

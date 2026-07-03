@@ -21,11 +21,13 @@ use crate::explorer::pages::common::{
     fmt_alkane_amount, fmt_amount, fmt_scaled_amount, format_fee_rate,
 };
 use crate::explorer::paths::explorer_path;
+use crate::explorer::phishing::is_phishing_alkane;
 use crate::modules::essentials::storage::{BalanceEntry, EssentialsProvider, load_creation_record};
 use crate::modules::essentials::utils::balances::{
     OutpointLookup, project_tx_output_balances_from_traces,
 };
 use crate::modules::essentials::utils::inspections::{StoredInspectionResult, load_inspection};
+use crate::modules::essentials::utils::names::display_alkane_name;
 use crate::modules::runes::storage::{RuneBalance, RunesProvider, TxRuneIo};
 use crate::runtime::mdb::Mdb;
 use crate::schemas::SchemaAlkaneId;
@@ -376,6 +378,7 @@ fn parse_factory_clone(
     inputs: Option<&Vec<String>>,
     created: Option<SchemaAlkaneId>,
 ) -> Option<(SchemaAlkaneId, Option<SchemaAlkaneId>)> {
+    let created = created?;
     let inputs = inputs?;
     if inputs.len() < 2 {
         return None;
@@ -387,7 +390,7 @@ fn parse_factory_clone(
         6 => SchemaAlkaneId { block: 3, tx: n as u64 },
         _ => return None,
     };
-    Some((template, created))
+    Some((template, Some(created)))
 }
 
 fn decode_trace_response(data_hex: &str) -> Option<String> {
@@ -1420,6 +1423,9 @@ fn balances_list(
                         }
                         span class="alk-amt mono" { (fmt_alkane_amount(be.amount)) }
                         a class="alk-sym link mono" href=(explorer_path(&format!("/alkane/{alk}"))) { (meta.name.value.clone()) }
+                        @if is_phishing_alkane(&be.alkane) {
+                            span class="tag scam-tag" { "SCAM" }
+                        }
                     }
                 };
                 (inner)
@@ -1492,8 +1498,8 @@ pub(crate) fn alkane_meta(
     let mut symbol: Option<String> = None;
 
     if let Ok(Some(rec)) = load_creation_record(essentials_mdb, id) {
-        if let Some(n) = rec.names.first().map(|s| s.trim()).filter(|s| !s.is_empty()) {
-            name = Some(n.to_string());
+        if let Some(n) = display_alkane_name(&rec.names) {
+            name = Some(n);
         }
         if let Some(s) = rec.symbols.first().map(|s| s.trim()).filter(|s| !s.is_empty()) {
             symbol = Some(s.to_string());
@@ -1516,7 +1522,7 @@ pub(crate) fn alkane_meta(
     meta
 }
 
-fn json_viewer(value: Option<&Value>, raw: &str) -> Markup {
+pub fn json_viewer(value: Option<&Value>, raw: &str) -> Markup {
     match value {
         Some(v) => {
             let mut buf = String::new();
@@ -1601,5 +1607,27 @@ fn render_json_value(v: &Value, depth: usize, out: &mut String) {
             }
             out.push_str(r#"<span class="jv-brace">}</span>"#);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_factory_clone_ignores_opcode_without_create_event() {
+        let inputs = vec!["0x5".to_string(), "0x5d0adea1ddad41f012232eeb51c151e3".to_string()];
+
+        assert!(parse_factory_clone(Some(&inputs), None).is_none());
+    }
+
+    #[test]
+    fn parse_factory_clone_requires_create_event() {
+        let inputs = vec!["0x5".to_string(), "0x12f1d".to_string()];
+        let created = SchemaAlkaneId { block: 2, tx: 80663 };
+
+        let parsed = parse_factory_clone(Some(&inputs), Some(created));
+
+        assert_eq!(parsed, Some((SchemaAlkaneId { block: 2, tx: 77597 }, Some(created))));
     }
 }

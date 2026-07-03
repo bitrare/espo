@@ -129,6 +129,10 @@ fn default_address_index_chunk_size() -> u32 {
     512
 }
 
+fn default_trace_read_workers() -> u16 {
+    8
+}
+
 fn default_mempool_enabled() -> bool {
     true
 }
@@ -174,6 +178,10 @@ fn default_mempool_template_recalc_ms() -> u64 {
 
 fn normalize_optional_string(value: Option<String>) -> Option<String> {
     value.map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+}
+
+fn default_sync_banner_enabled() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -230,10 +238,95 @@ pub struct MiscConfig {
     pub show_terminal_ad: bool,
 }
 
+fn default_jemalloc_profile_dump_dir() -> String {
+    "./jemalloc-profiles".to_string()
+}
+
+fn default_jemalloc_profile_interval_secs() -> u64 {
+    1800
+}
+
+fn default_jemalloc_profile_dump_on_shutdown() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct JemallocProfileConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_jemalloc_profile_dump_dir")]
+    pub dump_dir: String,
+    #[serde(default = "default_jemalloc_profile_interval_secs")]
+    pub interval_secs: u64,
+    #[serde(default = "default_jemalloc_profile_dump_on_shutdown")]
+    pub dump_on_shutdown: bool,
+}
+
+impl Default for JemallocProfileConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            dump_dir: default_jemalloc_profile_dump_dir(),
+            interval_secs: default_jemalloc_profile_interval_secs(),
+            dump_on_shutdown: default_jemalloc_profile_dump_on_shutdown(),
+        }
+    }
+}
+
+impl JemallocProfileConfig {
+    fn normalized(mut self) -> Result<Self> {
+        self.dump_dir = self.dump_dir.trim().to_string();
+        if self.enabled && self.dump_dir.is_empty() {
+            anyhow::bail!("jemalloc_profile.dump_dir must be non-empty when enabled");
+        }
+        Ok(self)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SyncBannerConfig {
+    #[serde(default = "default_sync_banner_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub message: String,
+    #[serde(default)]
+    pub message_zh: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub link_text: Option<String>,
+    #[serde(default)]
+    pub link_text_zh: Option<String>,
+}
+
+impl SyncBannerConfig {
+    fn normalized(self) -> Option<Self> {
+        if !self.enabled {
+            return None;
+        }
+
+        let message = self.message.trim().to_string();
+        if message.is_empty() {
+            return None;
+        }
+
+        Some(Self {
+            enabled: self.enabled,
+            message,
+            message_zh: normalize_optional_string(self.message_zh),
+            url: normalize_optional_string(self.url),
+            link_text: normalize_optional_string(self.link_text),
+            link_text_zh: normalize_optional_string(self.link_text_zh),
+        })
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct MempoolConfig {
     #[serde(default = "default_mempool_enabled")]
     pub enabled: bool,
+    #[serde(default)]
+    pub populate_with_views: bool,
     #[serde(default = "default_mempool_raw_poll_secs")]
     pub raw_poll_secs: u64,
     #[serde(default = "default_mempool_template_poll_secs")]
@@ -268,6 +361,7 @@ impl Default for MempoolConfig {
     fn default() -> Self {
         Self {
             enabled: default_mempool_enabled(),
+            populate_with_views: false,
             raw_poll_secs: default_mempool_raw_poll_secs(),
             template_poll_secs: default_mempool_template_poll_secs(),
             trace_workers: default_mempool_trace_workers(),
@@ -340,6 +434,8 @@ pub struct ConfigFile {
     pub bitcoind_blocks_dir: String,
     #[serde(default)]
     pub reset_mempool_on_startup: bool,
+    #[serde(default)]
+    pub rollback: Option<u32>,
     #[serde(default = "default_db_path")]
     pub db_path: String,
     #[serde(default = "default_sdb_poll_ms")]
@@ -356,16 +452,14 @@ pub struct ConfigFile {
     pub explorer_pizza_tv_endpoint: String,
     #[serde(default = "default_explorer_amm_prefix")]
     pub explorer_amm_prefix: String,
+    #[serde(default)]
+    pub sync_banner: Option<SyncBannerConfig>,
     #[serde(default = "default_network")]
     pub network: String,
     #[serde(default)]
     pub metashrew_db_label: Option<String>,
     #[serde(default)]
     pub strict_mode: Option<StrictModeConfig>,
-    /// Roll back indexed state to this height on startup, then resume indexing
-    /// from `rollback + 1`. Overridden by the `--rollback` CLI flag.
-    #[serde(default)]
-    pub rollback: Option<u32>,
     #[serde(default)]
     pub debug: bool,
     #[serde(default)]
@@ -380,12 +474,18 @@ pub struct ConfigFile {
     pub compact_tx_trace_rows: bool,
     #[serde(default = "default_address_index_chunk_size")]
     pub address_index_chunk_size: u32,
+    #[serde(default = "default_trace_read_workers")]
+    pub trace_read_workers: u16,
+    #[serde(default)]
+    pub recover_missing_traces_by_txid: bool,
     #[serde(default)]
     pub explorer_networks: Option<ExplorerNetworks>,
     #[serde(default)]
     pub google_analytics_tag: Option<String>,
     #[serde(default)]
     pub misc: MiscConfig,
+    #[serde(default)]
+    pub jemalloc_profile: JemallocProfileConfig,
     #[serde(default)]
     pub mempool: MempoolConfig,
     #[serde(default)]
@@ -403,6 +503,7 @@ pub struct AppConfig {
     pub bitcoind_rpc_pass: String,
     pub bitcoind_blocks_dir: String,
     pub reset_mempool_on_startup: bool,
+    pub rollback: Option<u32>,
     pub view_only: bool,
     pub db_path: String,
     pub sdb_poll_ms: u16,
@@ -412,12 +513,10 @@ pub struct AppConfig {
     pub explorer_base_path: String,
     pub explorer_pizza_tv_endpoint: String,
     pub explorer_amm_prefix: String,
+    pub sync_banner: Option<SyncBannerConfig>,
     pub network: Network,
     pub metashrew_db_label: Option<String>,
     pub strict_mode: Option<StrictModeConfig>,
-    /// Roll back indexed state to this height on startup, then resume indexing
-    /// from `rollback + 1`. Set via config file or the `--rollback` CLI flag.
-    pub rollback: Option<u32>,
     pub debug: bool,
     pub debug_ignore_ms: u64,
     pub debug_backup: Option<DebugBackupConfig>,
@@ -425,9 +524,12 @@ pub struct AppConfig {
     pub block_source_mode: BlockFetchMode,
     pub compact_tx_trace_rows: bool,
     pub address_index_chunk_size: u32,
+    pub trace_read_workers: u16,
+    pub recover_missing_traces_by_txid: bool,
     pub explorer_networks: Option<ExplorerNetworks>,
     pub google_analytics_tag: Option<String>,
     pub misc: MiscConfig,
+    pub jemalloc_profile: JemallocProfileConfig,
     pub mempool: MempoolConfig,
     pub modules: HashMap<String, serde_json::Value>,
 }
@@ -443,9 +545,7 @@ pub struct CliArgs {
     #[arg(long, default_value_t = false)]
     pub view_only: bool,
 
-    /// Roll back indexed state to this height on startup, then resume indexing
-    /// from `rollback + 1`. Overrides the config file. Cannot be combined with
-    /// --view-only or the ESPO_START_BLOCK env var.
+    /// On startup only, rewind indexed state so indexing resumes at this height.
     #[arg(long)]
     pub rollback: Option<u32>,
 }
@@ -469,7 +569,9 @@ impl AppConfig {
             .unwrap_or_else(default_explorer_amm_prefix);
         let explorer_networks = file.explorer_networks.and_then(|n| n.normalized());
         let google_analytics_tag = normalize_optional_string(file.google_analytics_tag);
+        let sync_banner = file.sync_banner.and_then(|b| b.normalized());
         let debug_backup = file.debug_backup;
+        let jemalloc_profile = file.jemalloc_profile.normalized()?;
 
         Ok(Self {
             readonly_metashrew_db_dir: file.readonly_metashrew_db_dir,
@@ -481,6 +583,7 @@ impl AppConfig {
             bitcoind_rpc_pass: file.bitcoind_rpc_pass,
             bitcoind_blocks_dir: file.bitcoind_blocks_dir,
             reset_mempool_on_startup: file.reset_mempool_on_startup,
+            rollback: file.rollback,
             view_only,
             db_path: file.db_path,
             sdb_poll_ms: file.sdb_poll_ms,
@@ -490,10 +593,10 @@ impl AppConfig {
             explorer_base_path,
             explorer_pizza_tv_endpoint,
             explorer_amm_prefix,
+            sync_banner,
             network,
             metashrew_db_label: normalize_optional_string(file.metashrew_db_label),
             strict_mode: file.strict_mode,
-            rollback: file.rollback,
             debug: file.debug,
             debug_ignore_ms: file.debug_ignore_ms,
             debug_backup,
@@ -501,9 +604,12 @@ impl AppConfig {
             block_source_mode,
             compact_tx_trace_rows: file.compact_tx_trace_rows,
             address_index_chunk_size: file.address_index_chunk_size,
+            trace_read_workers: file.trace_read_workers,
+            recover_missing_traces_by_txid: file.recover_missing_traces_by_txid,
             explorer_networks,
             google_analytics_tag,
             misc: file.misc,
+            jemalloc_profile,
             mempool: file.mempool,
             modules: file.modules,
         })
@@ -574,6 +680,9 @@ fn init_config_from_inner(cfg: AppConfig, espo_read_only: bool) -> Result<()> {
     }
     if cfg.address_index_chunk_size == 0 {
         anyhow::bail!("address_index_chunk_size must be greater than 0");
+    }
+    if cfg.trace_read_workers == 0 {
+        anyhow::bail!("trace_read_workers must be greater than 0");
     }
 
     cfg.explorer_base_path = normalize_explorer_base_path(&cfg.explorer_base_path)?;
@@ -676,7 +785,6 @@ fn init_config_from_inner(cfg: AppConfig, espo_read_only: bool) -> Result<()> {
 pub fn init_config() -> Result<()> {
     let cli = CliArgs::parse();
     let mut cfg = load_config_from_path(&cli.config_path, cli.view_only)?;
-    // CLI --rollback overrides any value from the config file.
     if cli.rollback.is_some() {
         cfg.rollback = cli.rollback;
     }
@@ -766,6 +874,18 @@ pub fn get_address_index_chunk_size() -> usize {
     get_config().address_index_chunk_size.max(1) as usize
 }
 
+pub fn get_trace_read_workers() -> usize {
+    std::env::var("ESPO_TRACE_READ_WORKERS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|workers| *workers > 0)
+        .unwrap_or_else(|| get_config().trace_read_workers.max(1) as usize)
+}
+
+pub fn recover_missing_traces_by_txid() -> bool {
+    get_config().recover_missing_traces_by_txid
+}
+
 pub fn is_strict_mode() -> bool {
     get_config()
         .strict_mode
@@ -822,6 +942,10 @@ pub fn get_explorer_pizza_tv_endpoint() -> &'static str {
 
 pub fn get_explorer_amm_prefix() -> &'static str {
     &get_config().explorer_amm_prefix
+}
+
+pub fn get_sync_banner() -> Option<&'static SyncBannerConfig> {
+    get_config().sync_banner.as_ref()
 }
 
 pub fn get_explorer_networks() -> Option<&'static ExplorerNetworks> {

@@ -1,10 +1,12 @@
 use crate::alkanes::trace::{
-    EspoSandshrewLikeTrace, EspoSandshrewLikeTraceEvent, EspoTrace, extract_alkane_storage,
-    prettyify_protobuf_trace_json,
+    EspoSandshrewLikeTrace, EspoSandshrewLikeTraceEvent, EspoSandshrewLikeTraceInvokeContext,
+    EspoSandshrewLikeTraceInvokeData, EspoSandshrewLikeTraceShortId, EspoTrace,
+    extract_alkane_storage, protobuf_trace_events,
 };
 use crate::bitcoind_flexible::FlexibleBitcoindClient as CoreClient;
 use crate::config::{
-    get_bitcoind_rpc_client, get_config, get_espo_db, get_metashrew_rpc_url, get_network,
+    get_bitcoind_rpc_client, get_config, get_espo_db, get_last_safe_tip, get_metashrew_rpc_url,
+    get_network,
 };
 use crate::modules::essentials::storage::{BalanceEntry, EssentialsProvider};
 use crate::modules::essentials::utils::balances::get_outpoint_balances_with_spent_batch;
@@ -16,20 +18,14 @@ use crate::modules::runes::transfer::{
     OutputRuneSheets, RuneSheet, RunestoneTransfer, TransferRules,
 };
 use crate::runtime::mdb::Mdb;
+use crate::runtime::shutdown::is_shutdown_requested;
 use crate::runtime::state_at::StateAt;
 use crate::schemas::{EspoOutpoint, SchemaAlkaneId};
 use anyhow::{Context, Result};
-use bitcoin::block::Version as BlockVersion;
-use bitcoin::blockdata::block::Header;
-use bitcoin::blockdata::script::Instruction;
-use bitcoin::blockdata::transaction::Version as TxVersion;
 use bitcoin::consensus::Encodable;
 use bitcoin::consensus::encode::deserialize;
 use bitcoin::hashes::Hash;
-use bitcoin::{
-    Address, Amount, Block, CompactTarget, Network, OutPoint, Sequence, Transaction, TxIn,
-    TxMerkleNode, TxOut, Txid, Witness, opcodes,
-};
+use bitcoin::{Address, Network, OutPoint, Transaction, Txid};
 use bitcoincore_rpc::RpcApi;
 use futures::{StreamExt, stream};
 use ordinals::{Artifact, Edict, RuneId, Runestone};
@@ -50,10 +46,9 @@ use tokio::sync::broadcast;
 
 /// --- Tunables (edit as needed) ---
 pub const MEMPOOL_POLL_SECS: u64 = 5;
-pub const MEMPOOL_PREVIEW_BATCH_SIZE: usize = 10;
-pub const MEMPOOL_PREVIEW_TX_CONCURRENCY: usize = 6;
+pub const MEMPOOL_VIEW_BATCH_SIZE: usize = 10;
 pub const MEMPOOL_LOG_STEP: usize = 100;
-pub const MEMPOOL_MAX_TXS: usize = 50_000;
+pub const MEMPOOL_MAX_TXS: usize = 200_000;
 pub const MEMPOOL_MIN_FEE_RATE_SATS_VBYTE: f64 = 0.5;
 /// --- End tunables ---
 
@@ -149,8 +144,11 @@ pub struct MempoolBlockDelta {
 pub struct MempoolBlockTx {
     pub txid: Txid,
     pub tx: Transaction,
+    pub protostones: Vec<Protostone>,
     pub traces: Option<Vec<EspoTrace>>,
     pub rune_io: Option<TxRuneIo>,
+    pub addresses: Vec<String>,
+    pub first_seen: u64,
     pub fee_sat: u64,
     pub vsize: u64,
     pub fee_rate: f64,
@@ -532,18 +530,7 @@ fn protostones_for_tx(tx: &Transaction) -> Vec<Protostone> {
     }
 }
 
-fn tx_has_runestone_carrier(tx: &Transaction) -> bool {
-    tx.output.iter().any(|output| {
-        let mut instructions = output.script_pubkey.instructions();
-        matches!(instructions.next(), Some(Ok(Instruction::Op(opcodes::all::OP_RETURN))))
-            && matches!(instructions.next(), Some(Ok(Instruction::Op(opcodes::all::OP_PUSHNUM_13))))
-    })
-}
-
 fn is_uncommon_goods_mint_tx(tx: &Transaction) -> bool {
-    if !tx_has_runestone_carrier(tx) {
-        return false;
-    }
     Runestone::decipher(tx)
         .as_ref()
         .and_then(|artifact| artifact.mint())
@@ -762,7 +749,7 @@ fn project_rune_io_for_block(
         let Some(tx) = txs.get(txid).and_then(|entry| entry.tx.as_ref()) else {
             continue;
         };
-        let artifact = tx_has_runestone_carrier(tx).then(|| Runestone::decipher(tx)).flatten();
+        let artifact = Runestone::decipher(tx);
         let mut io = TxRuneIo::default();
         let mut unallocated: RuneSheet<SchemaRuneId> = BTreeMap::new();
 
@@ -937,6 +924,64 @@ fn diesel_trace_for_tx(
     let protobuf_trace = alkanes_support::proto::alkanes::AlkanesTrace::default();
     let storage_changes = extract_alkane_storage(&protobuf_trace, tx).unwrap_or_default();
     Some(vec![EspoTrace { sandshrew_trace, protobuf_trace, storage_changes, outpoint }])
+}
+
+fn trace_short_id_from_schema(id: &SchemaAlkaneId) -> EspoSandshrewLikeTraceShortId {
+    EspoSandshrewLikeTraceShortId { block: hex_u128(id.block as u128), tx: hex_u128(id.tx as u128) }
+}
+
+fn fast_trace_for_protostone(
+    txid: &Txid,
+    tx: &Transaction,
+    vout: u32,
+    protostone: &Protostone,
+) -> Option<EspoTrace> {
+    let cellpack = cellpack_from_protostone(protostone)?;
+    let contract_id = SchemaAlkaneId {
+        block: cellpack.target.block.try_into().ok()?,
+        tx: cellpack.target.tx.try_into().ok()?,
+    };
+    let invoke = EspoSandshrewLikeTraceEvent::Invoke(EspoSandshrewLikeTraceInvokeData {
+        typ: "call".to_string(),
+        context: EspoSandshrewLikeTraceInvokeContext {
+            myself: trace_short_id_from_schema(&contract_id),
+            caller: EspoSandshrewLikeTraceShortId {
+                block: "0x0".to_string(),
+                tx: "0x0".to_string(),
+            },
+            inputs: cellpack.inputs.iter().map(|value| hex_u128(*value)).collect(),
+            incoming_alkanes: Vec::new(),
+            vout,
+        },
+        fuel: 0,
+    });
+    let sandshrew_trace =
+        EspoSandshrewLikeTrace { outpoint: format!("{}:{}", txid, vout), events: vec![invoke] };
+    let protobuf_trace = alkanes_support::proto::alkanes::AlkanesTrace::default();
+    let storage_changes = extract_alkane_storage(&protobuf_trace, tx).unwrap_or_default();
+    let outpoint = EspoOutpoint { txid: txid.to_byte_array().to_vec(), vout, tx_spent: None };
+
+    Some(EspoTrace { sandshrew_trace, protobuf_trace, storage_changes, outpoint })
+}
+
+fn fast_traces_for_tx(
+    txid: &Txid,
+    tx: &Transaction,
+    protostones: &[Protostone],
+) -> Option<Vec<EspoTrace>> {
+    if protostones.is_empty() {
+        return None;
+    }
+
+    let base = shadow_base(tx);
+    let traces = protostones
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, protostone)| {
+            fast_trace_for_protostone(txid, tx, base + idx as u32, protostone)
+        })
+        .collect();
+    Some(traces)
 }
 
 fn combined_traces(entry: &MempoolTransactionStruct) -> Option<Vec<EspoTrace>> {
@@ -1320,27 +1365,6 @@ pub fn get_mempool_block_detail(
             MempoolTxFilter::Rune => entry_has_rune_action(entry),
         }
     });
-    ordered.sort_by(|a, b| {
-        let aa = state.txs.get(a);
-        let bb = state.txs.get(b);
-        let a_rate = package_rates
-            .get(a)
-            .copied()
-            .or_else(|| aa.map(|tx| tx.fee_rate))
-            .unwrap_or_default();
-        let b_rate = package_rates
-            .get(b)
-            .copied()
-            .or_else(|| bb.map(|tx| tx.fee_rate))
-            .unwrap_or_default();
-        let a_fee = aa.map(|tx| tx.fee_sat).unwrap_or_default();
-        let b_fee = bb.map(|tx| tx.fee_sat).unwrap_or_default();
-        b_rate
-            .partial_cmp(&a_rate)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| b_fee.cmp(&a_fee))
-            .then_with(|| a.cmp(b))
-    });
     let tx_total = ordered.len();
     let off = limit.saturating_mul(page.saturating_sub(1));
     let end = off.saturating_add(limit).min(tx_total);
@@ -1353,8 +1377,11 @@ pub fn get_mempool_block_detail(
                 Some(MempoolBlockTx {
                     txid: *txid,
                     tx,
+                    protostones: entry.protostones.clone(),
                     traces: combined_traces(entry),
                     rune_io: entry.rune_io.clone(),
+                    addresses: entry.addresses.clone(),
+                    first_seen: entry.first_seen,
                     fee_sat: entry.fee_sat,
                     vsize: entry.vsize,
                     fee_rate: package_rates.get(txid).copied().unwrap_or(entry.fee_rate),
@@ -1390,8 +1417,11 @@ pub fn get_mempool_block_ordered_transactions(index: usize) -> Option<Vec<Mempoo
                 Some(MempoolBlockTx {
                     txid: *txid,
                     tx,
+                    protostones: entry.protostones.clone(),
                     traces: combined_traces(entry),
                     rune_io: entry.rune_io.clone(),
+                    addresses: entry.addresses.clone(),
+                    first_seen: entry.first_seen,
                     fee_sat: entry.fee_sat,
                     vsize: entry.vsize,
                     fee_rate: package_rates.get(txid).copied().unwrap_or(entry.fee_rate),
@@ -1402,6 +1432,55 @@ pub fn get_mempool_block_ordered_transactions(index: usize) -> Option<Vec<Mempoo
             })
             .collect(),
     )
+}
+
+pub fn get_mempool_index_transactions_ordered_by_block_and_fee() -> Vec<MempoolBlockTx> {
+    let Ok(state) = mempool_state().read() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for template in &state.templates {
+        let ordered: Vec<Txid> = template
+            .transaction_ids
+            .iter()
+            .filter_map(|txid_str| Txid::from_str(txid_str).ok())
+            .collect();
+        let package_rates =
+            package_effective_rates_for_block(&ordered, &state.txs, &HashMap::new());
+        let mut block_txs = ordered
+            .iter()
+            .filter_map(|txid| {
+                let entry = state.txs.get(txid)?;
+                let tx = entry.tx.clone()?;
+                Some(MempoolBlockTx {
+                    txid: *txid,
+                    tx,
+                    protostones: entry.protostones.clone(),
+                    traces: combined_traces(entry),
+                    rune_io: entry.rune_io.clone(),
+                    addresses: entry.addresses.clone(),
+                    first_seen: entry.first_seen,
+                    fee_sat: entry.fee_sat,
+                    vsize: entry.vsize,
+                    fee_rate: package_rates.get(txid).copied().unwrap_or(entry.fee_rate),
+                    position: entry.position.clone(),
+                    readiness: derive_readiness(entry),
+                    defer_alkane_trace_status: entry_defers_alkane_trace_status(entry),
+                })
+            })
+            .collect::<Vec<_>>();
+        block_txs.sort_by(|left, right| {
+            right
+                .fee_sat
+                .cmp(&left.fee_sat)
+                .then_with(|| {
+                    right.fee_rate.partial_cmp(&left.fee_rate).unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| left.txid.cmp(&right.txid))
+        });
+        out.extend(block_txs);
+    }
+    out
 }
 
 pub fn get_mempool_block_transactions_for_targets(
@@ -1448,8 +1527,11 @@ pub fn get_mempool_block_transactions_for_targets(
                 Some(MempoolBlockTx {
                     txid: *txid,
                     tx,
+                    protostones: entry.protostones.clone(),
                     traces: combined_traces(entry),
                     rune_io: entry.rune_io.clone(),
+                    addresses: entry.addresses.clone(),
+                    first_seen: entry.first_seen,
                     fee_sat: entry.fee_sat,
                     vsize: entry.vsize,
                     fee_rate: entry.fee_rate,
@@ -1493,213 +1575,188 @@ fn shadow_base(tx: &Transaction) -> u32 {
     tx.output.len() as u32 + 1
 }
 
-fn encode_outpoint_hex(txid: &Txid, vout: u32) -> String {
+fn encode_outpoint_hex(txid: &Txid, vout: u32, height: u32) -> String {
     let mut outpoint = protorune::Outpoint::default();
     outpoint.txid = txid.to_byte_array().to_vec();
     outpoint.vout = vout;
-    let bytes = outpoint.encode_to_vec();
+    let mut bytes = Vec::with_capacity(4 + outpoint.encoded_len());
+    bytes.extend_from_slice(&height.to_le_bytes());
+    bytes.extend_from_slice(&outpoint.encode_to_vec());
     format!("0x{}", hex::encode(bytes))
 }
 
-fn build_preview_block_hex(txs_to_preview: &[Transaction]) -> Result<String> {
-    let coinbase = Transaction {
-        version: TxVersion::TWO,
-        lock_time: bitcoin::locktime::absolute::LockTime::ZERO,
-        input: vec![TxIn {
-            previous_output: bitcoin::OutPoint::null(),
-            script_sig: bitcoin::ScriptBuf::new(),
-            sequence: Sequence::MAX,
-            witness: Witness::from_slice(&[vec![0u8; 32]]),
-        }],
-        output: vec![TxOut {
-            value: Amount::from_sat(50_00000000),
-            script_pubkey: bitcoin::ScriptBuf::new(),
-        }],
-    };
-
-    let mut txs = Vec::with_capacity(txs_to_preview.len().saturating_add(1));
-    txs.push(coinbase);
-    txs.extend(txs_to_preview.iter().cloned());
-
-    let txids: Vec<Txid> = txs.iter().map(|t| t.compute_txid()).collect();
-    let merkle_root_txid =
-        bitcoin::merkle_tree::calculate_root(txids.into_iter()).unwrap_or_else(Txid::all_zeros);
-
-    let header = Header {
-        version: BlockVersion::TWO,
-        prev_blockhash: bitcoin::BlockHash::all_zeros(),
-        merkle_root: TxMerkleNode::from(merkle_root_txid),
-        time: now_ts() as u32,
-        bits: CompactTarget::from_consensus(0x1d00ffff),
-        nonce: 0,
-    };
-
-    let block = Block { header, txdata: txs };
-
-    let mut buf = Vec::new();
-    block.consensus_encode(&mut buf)?;
-    Ok(hex::encode(buf))
-}
-
-fn decode_trace_hex(data_hex: &str, txid: &Txid, tx: &Transaction, vout: u32) -> Result<EspoTrace> {
+fn decode_trace_hex(
+    data_hex: &str,
+    txid: &Txid,
+    tx: &Transaction,
+    vout: u32,
+) -> Result<Option<EspoTrace>> {
     let trimmed = data_hex.strip_prefix("0x").unwrap_or(data_hex);
     let bytes = hex::decode(trimmed)?;
+    if bytes.is_empty() {
+        return Ok(None);
+    }
     let protobuf_trace = alkanes_support::proto::alkanes::AlkanesTrace::decode(bytes.as_slice())
-        .with_context(|| "failed to decode preview trace protobuf")?;
-    let events_json_str = prettyify_protobuf_trace_json(&protobuf_trace)?;
-    let events: Vec<EspoSandshrewLikeTraceEvent> =
-        serde_json::from_str(&events_json_str).context("deserialize preview trace events")?;
+        .with_context(|| "failed to decode view trace protobuf")?;
+    let events = protobuf_trace_events(&protobuf_trace)?;
 
     let sandshrew_trace = EspoSandshrewLikeTrace { outpoint: format!("{}:{}", txid, vout), events };
     let storage_changes = extract_alkane_storage(&protobuf_trace, tx)?;
     let outpoint = EspoOutpoint { txid: txid.to_byte_array().to_vec(), vout, tx_spent: None };
 
-    Ok(EspoTrace { sandshrew_trace, protobuf_trace, storage_changes, outpoint })
+    Ok(Some(EspoTrace { sandshrew_trace, protobuf_trace, storage_changes, outpoint }))
 }
 
-fn preview_context_for_tx(txid: &Txid) -> Option<(Vec<Txid>, Vec<Transaction>)> {
-    let state = mempool_state().read().ok()?;
-    let entry = state.txs.get(txid)?;
-    let fallback_tx = entry.tx.clone()?;
-    let Some(template_index) = entry.template_index else {
-        return Some((vec![*txid], vec![fallback_tx]));
-    };
-    let template = state.templates.iter().find(|template| template.index == template_index)?;
-    let ordered: Vec<Txid> = template
-        .transaction_ids
-        .iter()
-        .filter_map(|txid_str| Txid::from_str(txid_str).ok())
-        .collect();
-    let context_txids = dependency_context_txids(txid, &ordered, &state.txs);
-    let context_txs: Option<Vec<Transaction>> = context_txids
-        .iter()
-        .map(|context_txid| state.txs.get(context_txid).and_then(|entry| entry.tx.clone()))
-        .collect();
-    context_txs
-        .filter(|txs| !txs.is_empty())
-        .map(|txs| (context_txids, txs))
-        .or_else(|| Some((vec![*txid], vec![fallback_tx])))
-}
-
-fn dependency_context_txids(
-    target: &Txid,
-    ordered: &[Txid],
-    txs: &HashMap<Txid, MempoolTransactionStruct>,
-) -> Vec<Txid> {
-    let in_block: HashSet<Txid> = ordered.iter().copied().collect();
-    let mut needed: HashSet<Txid> = HashSet::from([*target]);
-    let mut stack = vec![*target];
-
-    while let Some(txid) = stack.pop() {
-        let Some(entry) = txs.get(&txid) else {
-            continue;
-        };
-        for prev in &entry.spent_outpoints {
-            let parent = prev.txid;
-            if in_block.contains(&parent) && needed.insert(parent) {
-                stack.push(parent);
-            }
-        }
+fn compact_view_error(error: &Value) -> String {
+    let code = error.get("code").and_then(|v| v.as_i64());
+    let message = error
+        .get("message")
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| error.as_str().unwrap_or("unknown metashrew_view error"))
+        .lines()
+        .next()
+        .unwrap_or("unknown metashrew_view error");
+    let mut summary: String = message.chars().take(300).collect();
+    if message.chars().count() > 300 {
+        summary.push_str("...");
     }
-
-    ordered.iter().filter(|txid| needed.contains(*txid)).copied().collect()
+    match code {
+        Some(code) => format!("code {code}: {summary}"),
+        None => summary,
+    }
 }
 
-async fn preview_traces_for_tx(
+async fn view_traces_for_tx(
     http: &Client,
-    preview_url: &str,
+    view_url: &str,
     txid: &Txid,
     tx: &Transaction,
     protostone_count: usize,
-    preview_txs: &[Transaction],
 ) -> Option<Vec<EspoTrace>> {
+    if is_shutdown_requested() {
+        return None;
+    }
     if protostone_count == 0 {
         return None;
     }
-    let block_hex = match build_preview_block_hex(preview_txs) {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("[mempool] build preview block failed for {}: {e:?}", txid);
-            return None;
-        }
-    };
     let base = shadow_base(tx);
+    let input_height = get_last_safe_tip().unwrap_or_default();
     let mut jobs: Vec<(u32, String)> = Vec::with_capacity(protostone_count);
     for idx in 0..protostone_count {
         let vout = base + idx as u32;
-        jobs.push((vout, encode_outpoint_hex(txid, vout)));
+        jobs.push((vout, encode_outpoint_hex(txid, vout, input_height)));
     }
 
     let mut traces: Vec<EspoTrace> = Vec::new();
-    for batch in jobs.chunks(MEMPOOL_PREVIEW_BATCH_SIZE) {
+    let mut had_error = false;
+    for batch in jobs.chunks(MEMPOOL_VIEW_BATCH_SIZE) {
+        if is_shutdown_requested() {
+            return None;
+        }
         let owned_batch: Vec<(u32, String)> = batch.to_vec();
         let futs = stream::iter(owned_batch.into_iter().map(|(vout, input_hex)| {
             let body = json!({
                 "jsonrpc": "2.0",
                 "id": format!("{}:{}", txid, vout),
-                "method": "metashrew_preview",
+                "method": "metashrew_view",
                 "params": [
-                    block_hex,
                     "trace",
                     input_hex,
                     "latest",
                 ]
             });
             let http = http.clone();
-            let preview_url = preview_url.to_string();
+            let view_url = view_url.to_string();
             let txid = *txid;
             async move {
-                let resp_json: Value = match http.post(&preview_url).json(&body).send().await {
+                if is_shutdown_requested() {
+                    return Err(());
+                }
+                let resp_json: Value = match http.post(&view_url).json(&body).send().await {
                     Ok(r) => match r.error_for_status() {
                         Ok(ok) => match ok.json().await {
                             Ok(v) => v,
                             Err(e) => {
-                                eprintln!(
-                                    "[mempool] preview decode failed for {}@{}: {:?}",
-                                    txid, vout, e
-                                );
-                                return None;
+                                if !is_shutdown_requested() {
+                                    eprintln!(
+                                        "[mempool] view response decode failed for {}@{}: {:?}",
+                                        txid, vout, e
+                                    );
+                                }
+                                return Err(());
                             }
                         },
                         Err(e) => {
-                            eprintln!(
-                                "[mempool] preview HTTP error for {}@{}: {:?}",
-                                txid, vout, e
-                            );
-                            return None;
+                            if !is_shutdown_requested() {
+                                eprintln!(
+                                    "[mempool] view HTTP error for {}@{}: {:?}",
+                                    txid, vout, e
+                                );
+                            }
+                            return Err(());
                         }
                     },
                     Err(e) => {
-                        eprintln!("[mempool] preview POST failed for {}@{}: {:?}", txid, vout, e);
-                        return None;
+                        if !is_shutdown_requested() {
+                            eprintln!("[mempool] view POST failed for {}@{}: {:?}", txid, vout, e);
+                        }
+                        return Err(());
                     }
                 };
 
+                if let Some(error) = resp_json.get("error") {
+                    if !is_shutdown_requested() {
+                        eprintln!(
+                            "[mempool] metashrew_view trace failed for {}@{}: {}",
+                            txid,
+                            vout,
+                            compact_view_error(error)
+                        );
+                    }
+                    return Err(());
+                }
                 let result_hex = resp_json.get("result").and_then(|v| v.as_str()).or_else(|| {
                     resp_json.get("result").and_then(|v| v.get("trace")).and_then(|v| v.as_str())
                 });
                 let Some(result_hex) = result_hex else {
-                    return None;
+                    if !is_shutdown_requested() {
+                        eprintln!(
+                            "[mempool] metashrew_view trace missing result for {}@{}",
+                            txid, vout
+                        );
+                    }
+                    return Err(());
                 };
                 match decode_trace_hex(result_hex, &txid, tx, vout) {
-                    Ok(trace) => Some(trace),
+                    Ok(trace) => Ok(trace),
                     Err(e) => {
-                        eprintln!(
-                            "[mempool] decode preview trace {}@{} failed: {:?}",
-                            txid, vout, e
-                        );
-                        None
+                        if !is_shutdown_requested() {
+                            eprintln!(
+                                "[mempool] decode view trace {}@{} failed: {:?}",
+                                txid, vout, e
+                            );
+                        }
+                        Err(())
                     }
                 }
             }
         }))
-        .buffer_unordered(MEMPOOL_PREVIEW_BATCH_SIZE);
+        .buffer_unordered(MEMPOOL_VIEW_BATCH_SIZE);
 
         futures::pin_mut!(futs);
         while let Some(res) = futs.next().await {
-            if let Some(t) = res {
-                traces.push(t);
+            match res {
+                Ok(Some(t)) => {
+                    traces.push(t);
+                }
+                Ok(None) => {}
+                Err(()) => {
+                    had_error = true;
+                }
             }
+        }
+        if had_error {
+            return None;
         }
     }
 
@@ -2471,7 +2528,7 @@ fn recalculate_memory_templates() {
     }
     template_txids.retain(|txids| !txids.is_empty());
 
-    let mut stale_trace_contexts: HashMap<Txid, Vec<Txid>> = HashMap::new();
+    let mut stale_trace_txids: HashSet<Txid> = HashSet::new();
     for txids in &template_txids {
         for txid in txids {
             let Some(tx) = template_state.get(txid) else {
@@ -2480,9 +2537,8 @@ fn recalculate_memory_templates() {
             if tx.is_diesel_mint || tx.protostones.is_empty() {
                 continue;
             }
-            let context = dependency_context_txids(txid, txids, &template_state);
-            if tx.fixed_trace.is_none() || tx.fixed_trace_context.as_ref() != Some(&context) {
-                stale_trace_contexts.insert(*txid, context);
+            if tx.fixed_trace.is_none() {
+                stale_trace_txids.insert(*txid);
             }
         }
     }
@@ -2606,7 +2662,7 @@ fn recalculate_memory_templates() {
         }
     }
     let mut trace_requeue: Vec<Txid> = Vec::new();
-    for txid in stale_trace_contexts.keys().copied() {
+    for txid in stale_trace_txids.iter().copied() {
         if state.txs.contains_key(&txid) {
             trace_requeue.push(txid);
         }
@@ -2891,8 +2947,11 @@ fn start_mempool_hydration(network: Network) {
     });
 }
 
-async fn trace_worker(http: Client, preview_url: String) {
+async fn trace_worker(http: Client, view_url: String, populate_with_views: bool) {
     loop {
+        if is_shutdown_requested() {
+            break;
+        }
         let next = trace_queue().lock().ok().and_then(|mut queue| queue.pop_front());
         let Some(txid) = next else {
             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -2906,27 +2965,23 @@ async fn trace_worker(http: Client, preview_url: String) {
         let Some(transaction) = entry.tx.as_ref() else {
             continue;
         };
-        let (trace_context, preview_txs) = preview_context_for_tx(&txid)
-            .unwrap_or_else(|| (vec![txid], vec![transaction.clone()]));
-        if entry.fixed_trace.is_some() && entry.fixed_trace_context.as_ref() == Some(&trace_context)
-        {
+        if entry.fixed_trace.is_some() {
             continue;
         }
-        let traces = preview_traces_for_tx(
-            &http,
-            &preview_url,
-            &txid,
-            transaction,
-            entry.protostones.len(),
-            &preview_txs,
-        )
-        .await;
+        if is_shutdown_requested() {
+            break;
+        }
+        let traces = if populate_with_views {
+            view_traces_for_tx(&http, &view_url, &txid, transaction, entry.protostones.len()).await
+        } else {
+            fast_traces_for_tx(&txid, transaction, &entry.protostones)
+        };
         if let Some(traces) = traces {
             let mut event_entry = None;
             if let Ok(mut state) = mempool_state().write() {
                 if let Some(current) = state.txs.get_mut(&txid) {
                     current.fixed_trace = Some(traces);
-                    current.fixed_trace_context = Some(trace_context);
+                    current.fixed_trace_context = Some(vec![txid]);
                     current.readiness = derive_readiness(current);
                     event_entry = Some(current.clone());
                     state.updated_at = now_ts();
@@ -3056,7 +3111,7 @@ fn ingest_zmq_sequence(url: String) {
 
 pub async fn run_mempool_service(network: Network) -> Result<()> {
     let rpc = get_bitcoind_rpc_client();
-    let preview_url = get_metashrew_rpc_url().to_string();
+    let view_url = get_metashrew_rpc_url().to_string();
     let http = Client::new();
     let cfg = get_config().mempool.clone();
 
@@ -3066,8 +3121,8 @@ pub async fn run_mempool_service(network: Network) -> Result<()> {
     }
 
     eprintln!(
-        "[mempool] service starting (raw_poll={}s, template_poll={}s, preview_url={})",
-        cfg.raw_poll_secs, cfg.template_poll_secs, preview_url
+        "[mempool] service starting (raw_poll={}s, template_poll={}s, populate_with_views={}, view_url={})",
+        cfg.raw_poll_secs, cfg.template_poll_secs, cfg.populate_with_views, view_url
     );
 
     eprintln!("[mempool] startup getrawmempool refresh");
@@ -3083,7 +3138,7 @@ pub async fn run_mempool_service(network: Network) -> Result<()> {
     }
 
     for _ in 0..cfg.trace_workers.max(1) {
-        tokio::spawn(trace_worker(http.clone(), preview_url.clone()));
+        tokio::spawn(trace_worker(http.clone(), view_url.clone(), cfg.populate_with_views));
     }
 
     let template_poll = Duration::from_secs(cfg.template_poll_secs.max(1));
@@ -3091,6 +3146,9 @@ pub async fn run_mempool_service(network: Network) -> Result<()> {
     let mut last_raw_refresh = SystemTime::now();
 
     loop {
+        if is_shutdown_requested() {
+            return Ok(());
+        }
         let should_refresh = last_raw_refresh.elapsed().unwrap_or_default() >= raw_poll;
         if should_refresh {
             eprintln!("[mempool] canonical getrawmempool refresh");
@@ -3244,4 +3302,87 @@ pub fn purge_confirmed_from_chain() -> Result<usize> {
         eprintln!("[mempool] purged {} confirmed txs from store", removed);
     }
     Ok(removed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alkanes_support::cellpack::Cellpack;
+    use alkanes_support::id::AlkaneId;
+    use bitcoin::{
+        Amount, ScriptBuf, Sequence, TxIn, TxOut, Witness, absolute::LockTime, transaction::Version,
+    };
+
+    fn sample_tx() -> Transaction {
+        Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut { value: Amount::ZERO, script_pubkey: ScriptBuf::new() }],
+        }
+    }
+
+    fn cellpack_protostone(target: AlkaneId, inputs: Vec<u128>) -> Protostone {
+        let cellpack = Cellpack { target, inputs };
+        Protostone {
+            burn: None,
+            message: cellpack.encipher(),
+            edicts: Vec::new(),
+            refund: None,
+            pointer: None,
+            from: None,
+            protocol_tag: 1,
+        }
+    }
+
+    #[test]
+    fn fast_traces_for_tx_builds_summary_from_protostone_cellpack() {
+        let tx = sample_tx();
+        let txid = tx.compute_txid();
+        let protostone = cellpack_protostone(AlkaneId { block: 4, tx: 797 }, vec![42, 99, 1000]);
+
+        let traces = fast_traces_for_tx(&txid, &tx, &[protostone]).expect("fast traces");
+
+        assert_eq!(traces.len(), 1);
+        assert_eq!(traces[0].sandshrew_trace.outpoint, format!("{}:2", txid));
+        assert!(traces[0].protobuf_trace.events.is_empty());
+        assert_eq!(traces[0].outpoint.vout, 2);
+        assert_eq!(traces[0].outpoint.txid, txid.to_byte_array().to_vec());
+
+        let EspoSandshrewLikeTraceEvent::Invoke(invoke) = &traces[0].sandshrew_trace.events[0]
+        else {
+            panic!("expected invoke event");
+        };
+        assert_eq!(invoke.typ, "call");
+        assert_eq!(invoke.context.myself.block, "0x4");
+        assert_eq!(invoke.context.myself.tx, "0x31d");
+        assert_eq!(invoke.context.caller.block, "0x0");
+        assert_eq!(invoke.context.caller.tx, "0x0");
+        assert_eq!(invoke.context.inputs, vec!["0x2a", "0x63", "0x3e8"]);
+        assert_eq!(invoke.context.vout, 2);
+    }
+
+    #[test]
+    fn fast_traces_for_tx_marks_non_cellpack_protostones_processed() {
+        let tx = sample_tx();
+        let txid = tx.compute_txid();
+        let protostone = Protostone {
+            burn: None,
+            message: Vec::new(),
+            edicts: Vec::new(),
+            refund: None,
+            pointer: None,
+            from: None,
+            protocol_tag: 1,
+        };
+
+        let traces = fast_traces_for_tx(&txid, &tx, &[protostone]).expect("fast traces");
+
+        assert!(traces.is_empty());
+    }
 }

@@ -18,7 +18,7 @@ use espo::modules::ammdata::storage::AmmDataProvider;
 use espo::modules::essentials::storage::EssentialsProvider;
 use espo::modules::oylapi::config::OylApiConfig;
 use espo::modules::oylapi::server::router;
-use espo::modules::oylapi::storage::OylApiState;
+use espo::modules::oylapi::storage::{BtcUsdPriceCache, OylApiState};
 use espo::modules::subfrost::storage::SubfrostProvider;
 use espo::runtime::mdb::Mdb;
 use rocksdb::{DB, Options};
@@ -66,6 +66,7 @@ fn init_global_config() {
             bitcoind_rpc_pass: String::from("test"),
             bitcoind_blocks_dir: blocks_dir.to_str().unwrap().to_string(),
             reset_mempool_on_startup: false,
+            rollback: None,
             view_only: true,
             db_path: db_path.to_str().unwrap().to_string(),
             sdb_poll_ms: 100,
@@ -74,6 +75,8 @@ fn init_global_config() {
             explorer_host: None,
             explorer_base_path: String::from("/"),
             explorer_pizza_tv_endpoint: String::from("https://tv.pizza.fun"),
+            explorer_amm_prefix: String::from("https://www.oyl.io/swap"),
+            sync_banner: None,
             network: bitcoin::Network::Regtest,
             metashrew_db_label: None,
             strict_mode: None,
@@ -81,9 +84,12 @@ fn init_global_config() {
             block_source_mode: espo::core::blockfetcher::BlockFetchMode::Auto,
             compact_tx_trace_rows: true,
             address_index_chunk_size: 512,
+            trace_read_workers: 8,
+            recover_missing_traces_by_txid: false,
             explorer_networks: None,
             google_analytics_tag: None,
             misc: espo::config::MiscConfig::default(),
+            jemalloc_profile: espo::config::JemallocProfileConfig::default(),
             mempool: espo::config::MempoolConfig::default(),
             modules: std::collections::HashMap::new(),
         };
@@ -119,7 +125,14 @@ fn create_test_state() -> Result<OylApiState> {
 
     std::mem::forget(temp_dir);
 
-    Ok(OylApiState { config, essentials, ammdata, subfrost, http_client: reqwest::Client::new() })
+    Ok(OylApiState {
+        config,
+        essentials,
+        ammdata,
+        subfrost,
+        http_client: reqwest::Client::new(),
+        btc_usd_price_cache: Arc::new(BtcUsdPriceCache::new()),
+    })
 }
 
 /// Helper to make POST request to router

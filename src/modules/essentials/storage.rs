@@ -33,9 +33,10 @@ use rocksdb::{Direction, IteratorMode, ReadOptions};
 use serde_json::{Value, json, map::Map};
 
 use crate::runtime::mempool::{
-    MempoolBlockTx, MempoolEntry, get_mempool_index_transactions_ordered_by_block_and_fee,
-    get_seen_txids_page, get_tx_from_mempool, pending_action_entries_with_fee, pending_by_txid,
-    pending_for_address,
+    MempoolBlockTx, MempoolEntry, get_mempool_block_ordered_transactions,
+    get_mempool_block_template, get_mempool_index_transactions_ordered_by_block_and_fee,
+    mempool_entry_from_block_tx, get_seen_txids_page, get_tx_from_mempool,
+    pending_action_entries_with_fee, pending_by_txid, pending_for_address,
 };
 use crate::utils::electrum_like::{AddressHistoryEntry, AddressUtxo, ElectrumLikeBackend};
 pub use crate::utils::fee_rates::{BlockFeeRateSummary, compute_block_fee_rate_summary};
@@ -3871,11 +3872,9 @@ impl EssentialsProvider {
         let limit = params.limit.unwrap_or(50).max(1).min(100) as usize;
         let hide_diesel = params.hide_diesel_mints.unwrap_or(false);
         let next_block_only = params.next_block_only.unwrap_or(false);
+        let diesel_only = params.diesel_only.unwrap_or(false);
         let off = limit.saturating_mul(page.saturating_sub(1));
 
-        // Get all mempool entries with alkane/rune actions and fee data
-        let all_action_entries = pending_action_entries_with_fee();
-        
         // Helper to check if entry is a diesel mint
         let is_diesel_mint = |entry: &MempoolEntry| -> bool {
             entry.traces.as_ref().map_or(false, |traces| {
@@ -3885,70 +3884,125 @@ impl EssentialsProvider {
             })
         };
 
-        // Special handling for next_block_only: return both diesel and other in separate arrays
-        if next_block_only {
-            let mut diesel_entries: Vec<(MempoolEntry, f64, u64, u64)> = Vec::new();
-            let mut other_entries: Vec<(MempoolEntry, f64, u64, u64)> = Vec::new();
-
-            for (entry, fee_rate, fee_sat, vsize) in all_action_entries {
-                // Filter: only keep transactions with traces
-                if entry.traces.as_ref().map_or(true, |t| t.is_empty()) {
-                    continue;
-                }
-                // Filter: only next block transactions
-                if !entry.position.as_ref().map_or(false, |p| p.block == 0) {
-                    continue;
-                }
-                
-                if is_diesel_mint(&entry) {
-                    diesel_entries.push((entry, fee_rate, fee_sat, vsize));
-                } else {
-                    other_entries.push((entry, fee_rate, fee_sat, vsize));
-                }
-            }
-
+        // All pending diesel mints (full mempool queue, any feerate / block position).
+        if diesel_only {
+            let all_action_entries = pending_action_entries_with_fee();
+            let diesel_entries: Vec<(MempoolEntry, f64, u64, u64)> = all_action_entries
+                .into_iter()
+                .filter(|(entry, _, _, _)| {
+                    entry.traces.as_ref().map_or(false, |t| !t.is_empty()) && is_diesel_mint(entry)
+                })
+                .collect();
             let diesel_total = diesel_entries.len();
-            let other_total = other_entries.len();
-
-            // Apply pagination to each category
             let diesel_page: Vec<_> = diesel_entries.into_iter().skip(off).take(limit).collect();
-            let other_page: Vec<_> = other_entries.into_iter().skip(off).take(limit).collect();
-
-            // Collect all entries for batch processing
-            let all_page_entries: Vec<&(MempoolEntry, f64, u64, u64)> = 
-                diesel_page.iter().chain(other_page.iter()).collect();
+            let all_page_entries: Vec<&(MempoolEntry, f64, u64, u64)> = diesel_page.iter().collect();
 
             if all_page_entries.is_empty() {
                 return Ok(RpcGetMempoolAlkaneTxsFullResult {
                     value: json!({
                         "ok": true,
-                        "diesel_mints": { "total": diesel_total, "has_more": diesel_total > off + limit, "transactions": [] },
-                        "other": { "total": other_total, "has_more": other_total > off + limit, "transactions": [] }
+                        "diesel_mints": { "total": diesel_total, "has_more": diesel_total > off + limit, "transactions": [] }
                     }),
                 });
             }
 
-            // Batch fetch balance data and prev txs for all entries
             let (outpoint_balances, prev_txs) = self.fetch_mempool_tx_data(&all_page_entries)?;
             let network = get_network();
-
-            // Build JSON for diesel entries
-            let diesel_txs: Vec<Value> = diesel_page.iter()
+            let diesel_txs: Vec<Value> = diesel_page
+                .iter()
                 .map(|(entry, fee_rate, fee_sat, vsize)| {
-                    self.mempool_entry_to_json(entry, *fee_rate, *fee_sat, *vsize, &outpoint_balances, &prev_txs, network)
-                })
-                .collect();
-
-            // Build JSON for other entries
-            let other_txs: Vec<Value> = other_page.iter()
-                .map(|(entry, fee_rate, fee_sat, vsize)| {
-                    self.mempool_entry_to_json(entry, *fee_rate, *fee_sat, *vsize, &outpoint_balances, &prev_txs, network)
+                    self.mempool_entry_to_json(
+                        entry, *fee_rate, *fee_sat, *vsize, &outpoint_balances, &prev_txs, network,
+                    )
                 })
                 .collect();
 
             return Ok(RpcGetMempoolAlkaneTxsFullResult {
                 value: json!({
                     "ok": true,
+                    "diesel_mints": {
+                        "total": diesel_total,
+                        "has_more": diesel_total > off + limit,
+                        "transactions": diesel_txs
+                    }
+                }),
+            });
+        }
+
+        // Special handling for next_block_only: txs from block template 0 with package-effective feerates.
+        if next_block_only {
+            let block_template = get_mempool_block_template(0);
+            let block_txs = get_mempool_block_ordered_transactions(0).unwrap_or_default();
+
+            let mut diesel_entries: Vec<(MempoolEntry, f64, u64, u64)> = Vec::new();
+            let mut other_entries: Vec<(MempoolEntry, f64, u64, u64)> = Vec::new();
+
+            for block_tx in block_txs {
+                if block_tx.traces.as_ref().map_or(true, |t| t.is_empty()) {
+                    continue;
+                }
+                let entry = mempool_entry_from_block_tx(&block_tx);
+                let tuple = (entry, block_tx.fee_rate, block_tx.fee_sat, block_tx.vsize);
+                if is_diesel_mint(&tuple.0) {
+                    diesel_entries.push(tuple);
+                } else {
+                    other_entries.push(tuple);
+                }
+            }
+
+            let diesel_total = diesel_entries.len();
+            let other_total = other_entries.len();
+            let diesel_page: Vec<_> = diesel_entries.into_iter().skip(off).take(limit).collect();
+            let other_page: Vec<_> = other_entries.into_iter().skip(off).take(limit).collect();
+            let all_page_entries: Vec<&(MempoolEntry, f64, u64, u64)> =
+                diesel_page.iter().chain(other_page.iter()).collect();
+
+            let block_template_json = block_template.as_ref().map(|template| {
+                json!({
+                    "index": template.index,
+                    "tx_count": template.tx_count,
+                    "trace_count": template.trace_count,
+                    "min_fee_rate": template.min_fee_rate,
+                    "median_fee_rate": template.median_fee_rate,
+                    "max_fee_rate": template.max_fee_rate,
+                    "fee_range": template.fee_range,
+                })
+            });
+
+            if all_page_entries.is_empty() {
+                return Ok(RpcGetMempoolAlkaneTxsFullResult {
+                    value: json!({
+                        "ok": true,
+                        "block_template": block_template_json,
+                        "diesel_mints": { "total": diesel_total, "has_more": diesel_total > off + limit, "transactions": [] },
+                        "other": { "total": other_total, "has_more": other_total > off + limit, "transactions": [] }
+                    }),
+                });
+            }
+
+            let (outpoint_balances, prev_txs) = self.fetch_mempool_tx_data(&all_page_entries)?;
+            let network = get_network();
+            let diesel_txs: Vec<Value> = diesel_page
+                .iter()
+                .map(|(entry, fee_rate, fee_sat, vsize)| {
+                    self.mempool_entry_to_json(
+                        entry, *fee_rate, *fee_sat, *vsize, &outpoint_balances, &prev_txs, network,
+                    )
+                })
+                .collect();
+            let other_txs: Vec<Value> = other_page
+                .iter()
+                .map(|(entry, fee_rate, fee_sat, vsize)| {
+                    self.mempool_entry_to_json(
+                        entry, *fee_rate, *fee_sat, *vsize, &outpoint_balances, &prev_txs, network,
+                    )
+                })
+                .collect();
+
+            return Ok(RpcGetMempoolAlkaneTxsFullResult {
+                value: json!({
+                    "ok": true,
+                    "block_template": block_template_json,
                     "diesel_mints": {
                         "total": diesel_total,
                         "has_more": diesel_total > off + limit,
@@ -3963,6 +4017,9 @@ impl EssentialsProvider {
             });
         }
 
+        // Get all mempool entries with alkane/rune actions and fee data
+        let all_action_entries = pending_action_entries_with_fee();
+        
         // Standard mode: filter and paginate as before
         let mut alkane_entries: Vec<(MempoolEntry, f64, u64, u64)> = Vec::new();
         for (entry, fee_rate, fee_sat, vsize) in all_action_entries {
@@ -8030,6 +8087,8 @@ pub struct RpcGetMempoolAlkaneTxsFullParams {
     pub limit: Option<u64>,
     pub hide_diesel_mints: Option<bool>,
     pub next_block_only: Option<bool>,
+    /// All pending diesel mints in the mempool (not limited to block template).
+    pub diesel_only: Option<bool>,
 }
 
 pub struct RpcGetMempoolAlkaneTxsFullResult {

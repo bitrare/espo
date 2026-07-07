@@ -1003,6 +1003,33 @@ fn mempool_entry_from_state(entry: &MempoolTransactionStruct) -> Option<MempoolE
     })
 }
 
+/// Build a mempool entry from a projected block tx (uses package-effective fee rate).
+pub fn mempool_entry_from_block_tx(block_tx: &MempoolBlockTx) -> MempoolEntry {
+    MempoolEntry {
+        txid: block_tx.txid,
+        tx: block_tx.tx.clone(),
+        traces: block_tx.traces.clone(),
+        rune_io: block_tx.rune_io.clone(),
+        has_alkane_action: block_tx.traces.as_ref().map_or(false, |traces| !traces.is_empty()),
+        has_rune_action: block_tx
+            .rune_io
+            .as_ref()
+            .map(rune_io_has_activity)
+            .unwrap_or(false),
+        defer_alkane_trace_status: block_tx.defer_alkane_trace_status,
+        first_seen: block_tx.first_seen,
+        position: block_tx.position.clone(),
+    }
+}
+
+/// Snapshot of a projected mempool block template (index 0 = next block).
+pub fn get_mempool_block_template(index: usize) -> Option<MempoolBlockTemplate> {
+    let Ok(state) = mempool_state().read() else {
+        return None;
+    };
+    state.templates.iter().find(|template| template.index == index).cloned()
+}
+
 fn entry_has_alkane_action(entry: &MempoolTransactionStruct) -> bool {
     !entry.protostones.is_empty()
         || entry.fixed_trace.as_ref().map_or(false, |traces| !traces.is_empty())

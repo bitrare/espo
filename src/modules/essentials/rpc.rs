@@ -90,6 +90,7 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                             limit: payload.get("limit").and_then(|v| v.as_u64()),
                             hide_diesel_mints: payload.get("hide_diesel_mints").and_then(|v| v.as_bool()),
                             next_block_only: payload.get("next_block_only").and_then(|v| v.as_bool()),
+                            diesel_only: payload.get("diesel_only").and_then(|v| v.as_bool()),
                         };
                         view.rpc_get_mempool_alkane_txs_full(params)
                             .map(|resp| resp.value)

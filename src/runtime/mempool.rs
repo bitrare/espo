@@ -629,7 +629,25 @@ fn alkane_transfer_json(id: &SchemaAlkaneId, value: u128) -> Value {
     })
 }
 
+fn input_alkane_balances_cache() -> &'static Mutex<HashMap<Txid, Vec<BalanceEntry>>> {
+    static CACHE: OnceLock<Mutex<HashMap<Txid, Vec<BalanceEntry>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+const INPUT_ALKANE_BALANCES_CACHE_MAX: usize = 100_000;
+
 fn input_alkane_balances_for_tx(tx: &Transaction) -> Vec<BalanceEntry> {
+    // A txid commits to its inputs, so the resolved input balances for a tx can
+    // never change; cache them. Template recalculation used to redo these DB
+    // batch lookups for every diesel mint on every recalc, which pegged the
+    // process on whale mints with 1000+ inputs.
+    let txid = tx.compute_txid();
+    if let Ok(cache) = input_alkane_balances_cache().lock() {
+        if let Some(hit) = cache.get(&txid) {
+            return hit.clone();
+        }
+    }
+
     let mut outpoints: Vec<(Txid, u32)> = tx
         .input
         .iter()
@@ -669,10 +687,18 @@ fn input_alkane_balances_for_tx(tx: &Transaction) -> Vec<BalanceEntry> {
         }
     }
 
-    by_alkane
+    let result: Vec<BalanceEntry> = by_alkane
         .into_iter()
         .map(|(alkane, amount)| BalanceEntry { alkane, amount })
-        .collect()
+        .collect();
+
+    if let Ok(mut cache) = input_alkane_balances_cache().lock() {
+        if cache.len() >= INPUT_ALKANE_BALANCES_CACHE_MAX {
+            cache.clear();
+        }
+        cache.insert(txid, result.clone());
+    }
+    result
 }
 
 fn add_rune_balances_to_sheet(
@@ -1589,6 +1615,11 @@ pub fn get_mempool_block_spenders(index: usize) -> Option<HashMap<(Txid, u32), T
 }
 
 pub fn publish_new_block_event(height: u32, txids: &[Txid]) {
+    // New blocks can make previously-unresolvable input outpoints indexed, so
+    // drop the memoized input balances and let them be recomputed once.
+    if let Ok(mut cache) = input_alkane_balances_cache().lock() {
+        cache.clear();
+    }
     publish_mempool_event(&json!({
         "type": "block",
         "data": {

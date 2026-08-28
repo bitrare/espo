@@ -50,7 +50,10 @@ pub fn register_rpc(
                 let p = Arc::clone(&p);
                 let e = Arc::clone(&e);
                 async move {
-                    p.rpc_get_block_summary(e.as_ref(), payload.get("height").and_then(|v| v.as_u64()))
+                    p.rpc_get_block_summary(
+                        e.as_ref(),
+                        payload.get("height").and_then(|v| v.as_u64()),
+                    )
                 }
             })
             .await;
@@ -130,7 +133,10 @@ pub fn register_rpc(
                 let p = Arc::clone(&p);
                 let a = Arc::clone(&a);
                 async move {
-                    p.rpc_get_btc_usd_price(a.as_ref(), payload.get("height").and_then(|v| v.as_u64()))
+                    p.rpc_get_btc_usd_price(
+                        a.as_ref(),
+                        payload.get("height").and_then(|v| v.as_u64()),
+                    )
                 }
             })
             .await;
@@ -148,9 +154,10 @@ pub fn register_rpc(
                 let p = Arc::clone(&p);
                 let e = Arc::clone(&e);
                 async move {
-                    let outpoints = payload.get("outpoints").and_then(|v| v.as_array()).map(|arr| {
-                        arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect()
-                    });
+                    let outpoints =
+                        payload.get("outpoints").and_then(|v| v.as_array()).map(|arr| {
+                            arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect()
+                        });
                     p.rpc_check_outpoints_spent(e.as_ref(), outpoints)
                 }
             })
@@ -169,7 +176,10 @@ pub fn register_rpc(
                 let p = Arc::clone(&p);
                 let e = Arc::clone(&e);
                 async move {
-                    p.rpc_get_alkane_tx_summary(e.as_ref(), payload.get("txid").and_then(|v| v.as_str()))
+                    p.rpc_get_alkane_tx_summary(
+                        e.as_ref(),
+                        payload.get("txid").and_then(|v| v.as_str()),
+                    )
                 }
             })
             .await;

@@ -7688,6 +7688,13 @@ struct LegacyBlockSummaryV0 {
 
 impl BlockSummary {
     pub fn decode(raw: &[u8]) -> Option<Self> {
+        // Leftover-tolerant: rc3 V5 blobs are these fields plus DIESEL extras.
+        {
+            let mut slice = raw;
+            if let Ok(summary) = Self::deserialize(&mut slice) {
+                return Some(summary);
+            }
+        }
         Self::try_from_slice(raw)
             .ok()
             .or_else(|| {
@@ -8794,7 +8801,10 @@ pub fn encode_tx_pointer_blob_v3(
 }
 
 pub fn decode_tx_pointer_blob_v3(bytes: &[u8]) -> Result<TxPointerBlobV3> {
-    TxPointerBlobV3::try_from_slice(bytes)
+    // Leftover-tolerant: rc3 blobs append tx_type + marketplace_info.
+    let mut slice = bytes;
+    TxPointerBlobV3::deserialize(&mut slice)
+        .or_else(|_| TxPointerBlobV3::try_from_slice(bytes))
         .map_err(|e| anyhow!("decode tx pointer blob v3 failed: {e}"))
 }
 

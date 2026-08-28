@@ -6,11 +6,12 @@ use super::rpc;
 use super::storage::{FairmintsProvider, classify_block_transaction};
 use crate::alkanes::trace::{EspoBlock, EspoSandshrewLikeTrace};
 use crate::config::get_network;
-use crate::modules::defs::{EspoModule, RpcNsRegistrar};
 use crate::modules::ammdata::storage::AmmDataProvider;
+use crate::modules::defs::{EspoModule, RpcNsRegistrar};
 use crate::modules::essentials::consts::essentials_genesis_block;
-use crate::modules::essentials::storage::EssentialsProvider;
+use crate::modules::essentials::storage::{EssentialsProvider, GetIndexHeightParams};
 use crate::runtime::mdb::Mdb;
+use crate::runtime::state_at::StateAt;
 use anyhow::Result;
 use bitcoin::Network;
 use std::collections::HashSet;
@@ -82,15 +83,53 @@ impl EspoModule for Fairmints {
             Arc::new(crate::config::espo_mdb(b"ammdata:")),
             Arc::clone(&essentials_provider),
         ));
-        self.essentials_provider = Some(essentials_provider);
+        self.essentials_provider = Some(Arc::clone(&essentials_provider));
         self.amm_provider = Some(amm_provider);
         let provider = FairmintsProvider::new(mdb);
-        match provider.get_index_height() {
-            Ok(h) => {
-                *self.index_height.write().unwrap() = h;
-                eprintln!("[FAIRMINTS] loaded index height: {h:?}");
+        let local_height = provider.get_index_height();
+        let height = match local_height {
+            Ok(Some(h)) => {
+                eprintln!("[FAIRMINTS] loaded index height: Some({h})");
+                Some(h)
             }
-            Err(e) => eprintln!("[FAIRMINTS] failed to load /index_height: {e:?}"),
+            Ok(None) => {
+                // New prefix on an already-indexed DB: join at essentials tip.
+                // Otherwise module_resume_start_height() takes min() and replays genesis.
+                match essentials_provider
+                    .get_index_height(GetIndexHeightParams { blockhash: StateAt::Latest })
+                {
+                    Ok(res) => match res.height {
+                        Some(tip) => match provider.set_index_height(tip) {
+                            Ok(()) => {
+                                eprintln!(
+                                    "[FAIRMINTS] no local index; adopting essentials tip {tip} (skip genesis replay)"
+                                );
+                                Some(tip)
+                            }
+                            Err(e) => {
+                                eprintln!("[FAIRMINTS] failed to persist adopted tip {tip}: {e:?}");
+                                Some(tip)
+                            }
+                        },
+                        None => {
+                            eprintln!("[FAIRMINTS] loaded index height: None");
+                            None
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("[FAIRMINTS] essentials tip lookup failed: {e:?}");
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("[FAIRMINTS] failed to load /index_height: {e:?}");
+                None
+            }
+        };
+        *self.index_height.write().unwrap() = height;
+        if let Err(e) = provider.import_legacy_diesel_if_needed() {
+            eprintln!("[FAIRMINTS] diesel import failed: {e:?}");
         }
         self.provider = Some(Arc::new(provider));
     }
@@ -182,6 +221,11 @@ impl EspoModule for Fairmints {
         let essentials =
             self.essentials_provider.as_ref().expect("ModuleRegistry must call set_mdb()");
         let amm = self.amm_provider.as_ref().expect("ModuleRegistry must call set_mdb()");
-        rpc::register_rpc(reg.clone(), Arc::clone(provider), Arc::clone(essentials), Arc::clone(amm));
+        rpc::register_rpc(
+            reg.clone(),
+            Arc::clone(provider),
+            Arc::clone(essentials),
+            Arc::clone(amm),
+        );
     }
 }

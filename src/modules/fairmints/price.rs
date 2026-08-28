@@ -63,7 +63,9 @@ impl CoinGeckoPriceFeed {
             .get(&url)
             .header("x-cg-pro-api-key", &self.config.api_key)
             .send()
-            .with_context(|| format!("CoinGecko historical price request failed for {formatted_date}"))?;
+            .with_context(|| {
+                format!("CoinGecko historical price request failed for {formatted_date}")
+            })?;
         let resp = resp.error_for_status().context("CoinGecko API error")?;
         let parsed: HistoricalPriceResponse =
             resp.json().context("failed to parse CoinGecko response")?;

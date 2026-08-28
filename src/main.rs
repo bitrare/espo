@@ -66,10 +66,10 @@ use crate::config::{DebugBackupConfig, get_block_source, init_block_source};
 use crate::config::get_network;
 use crate::modules::ammdata::main::AmmData;
 use crate::modules::essentials::main::Essentials;
-use crate::modules::fairmints::main::Fairmints;
 use crate::modules::essentials::storage::{
     EssentialsProvider, GetBlockSummaryParams, cache_block_summary, preload_block_summary_cache,
 };
+use crate::modules::fairmints::main::Fairmints;
 use crate::modules::oylapi::main::OylApi;
 use crate::modules::pizzafun::main::Pizzafun;
 use crate::modules::runes::main::{Runes, runes_enabled_from_global_config};

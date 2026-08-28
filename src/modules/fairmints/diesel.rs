@@ -116,11 +116,15 @@ pub fn compute_diesel_block_stats(
 }
 
 pub fn mint_cost_scaled(stats: &DieselBlockStats) -> u128 {
-    (stats.mint_cost_sats as u128).saturating_mul(PRICE_SCALE).saturating_div(100_000_000)
+    (stats.mint_cost_sats as u128)
+        .saturating_mul(PRICE_SCALE)
+        .saturating_div(100_000_000)
 }
 
 pub fn mint_volume_scaled(stats: &DieselBlockStats) -> u128 {
-    (stats.total_fee_sats as u128).saturating_mul(PRICE_SCALE).saturating_div(100_000_000)
+    (stats.total_fee_sats as u128)
+        .saturating_mul(PRICE_SCALE)
+        .saturating_div(100_000_000)
 }
 
 pub fn compute_and_default_diesel_stats(

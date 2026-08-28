@@ -20,7 +20,8 @@ use crate::modules::essentials::utils::balances::{
 };
 use crate::runtime::mdb::{Mdb, MdbBatch};
 use crate::runtime::mempool::{
-    MempoolBlockTx, MempoolTxFilter, get_mempool_block_detail, get_mempool_block_ordered_transactions,
+    MempoolBlockTx, MempoolTxFilter, get_mempool_block_detail,
+    get_mempool_block_ordered_transactions,
     get_mempool_index_transactions_ordered_by_block_and_fee,
 };
 use crate::runtime::state_at::StateAt;
@@ -61,13 +62,13 @@ impl FairmintsProvider {
         k
     }
 
-    fn diesel_stats_key(height: u32) -> Vec<u8> {
+    pub fn diesel_stats_key(height: u32) -> Vec<u8> {
         let mut k = KEY_DIESEL_STATS_PREFIX.to_vec();
         k.extend_from_slice(height.to_string().as_bytes());
         k
     }
 
-    fn candle_m10_key(ts: u64) -> Vec<u8> {
+    pub fn candle_m10_key(ts: u64) -> Vec<u8> {
         let mut k = KEY_CANDLE_M10_PREFIX.to_vec();
         k.extend_from_slice(format!("{ts:020}").as_bytes());
         k
@@ -194,13 +195,7 @@ impl FairmintsProvider {
                     existing.volume = existing.volume.saturating_add(volume);
                     existing
                 } else {
-                    MintCostCandle {
-                        open: cost,
-                        high: cost,
-                        low: cost,
-                        close: cost,
-                        volume,
-                    }
+                    MintCostCandle { open: cost, high: cost, low: cost, close: cost, volume }
                 };
                 candle_write = Some((Self::candle_m10_key(bucket), borsh::to_vec(&candle)?));
             }
@@ -281,21 +276,26 @@ impl FairmintsProvider {
             Value::Object(map) => map,
             other => return other,
         };
-        if let Some(stats) = stats {
-            obj.insert("diesel_mint_count".into(), json!(stats.mint_count));
-            obj.insert("diesel_total_fee_sats".into(), json!(stats.total_fee_sats));
-            obj.insert("diesel_min_fee_rate".into(), json!(stats.min_fee_rate));
-            obj.insert("diesel_reward_recipients".into(), json!(stats.reward_recipients));
-            obj.insert("diesel_distributed".into(), json!(stats.distributed));
-            obj.insert("diesel_mint_cost_sats".into(), json!(stats.mint_cost_sats));
+        let diesel = if let Some(stats) = stats {
+            json!({
+                "mint_count": stats.mint_count,
+                "total_fee_sats": stats.total_fee_sats,
+                "min_fee_rate": stats.min_fee_rate,
+                "reward_recipients": stats.reward_recipients,
+                "distributed": stats.distributed,
+                "mint_cost_sats": stats.mint_cost_sats,
+            })
         } else {
-            obj.insert("diesel_mint_count".into(), json!(0));
-            obj.insert("diesel_total_fee_sats".into(), json!(0));
-            obj.insert("diesel_min_fee_rate".into(), json!(0.0));
-            obj.insert("diesel_reward_recipients".into(), json!(0));
-            obj.insert("diesel_distributed".into(), json!(0));
-            obj.insert("diesel_mint_cost_sats".into(), json!(0));
-        }
+            json!({
+                "mint_count": 0,
+                "total_fee_sats": 0,
+                "min_fee_rate": 0.0,
+                "reward_recipients": 0,
+                "distributed": 0,
+                "mint_cost_sats": 0,
+            })
+        };
+        obj.insert("diesel".into(), diesel);
         Value::Object(obj)
     }
 
@@ -351,11 +351,9 @@ impl FairmintsProvider {
                 continue;
             };
             let txid = Txid::from_byte_array(blob.txid);
-            let class = self.get_tx_class(&txid).ok().flatten().unwrap_or_else(|| {
-                StoredTxClass {
-                    tx_type: classify_transaction(&blob.traces, &[]).tx_type,
-                    marketplace_info: None,
-                }
+            let class = self.get_tx_class(&txid).ok().flatten().unwrap_or_else(|| StoredTxClass {
+                tx_type: classify_transaction(&blob.traces, &[]).tx_type,
+                marketplace_info: None,
             });
             if let Some(wanted) = filter_tx_type {
                 if class.tx_type != wanted {
@@ -561,7 +559,9 @@ impl FairmintsProvider {
             out
         }
 
-        let pick = |plugin: Option<(u32, u128)>, amm: Option<(u64, u128)>| -> Option<(u64, u128, &'static str)> {
+        let pick = |plugin: Option<(u32, u128)>,
+                    amm: Option<(u64, u128)>|
+         -> Option<(u64, u128, &'static str)> {
             match (plugin, amm) {
                 (Some((ph, pp)), Some((ah, ap))) => {
                     if u64::from(ph) >= ah {
@@ -582,9 +582,7 @@ impl FairmintsProvider {
                     return ok(height, price, "fairmints_coingecko", None);
                 }
             }
-            if let Ok(Some((h, price))) =
-                amm.get_btc_usd_price_entry_at_or_before_height(height)
-            {
+            if let Ok(Some((h, price))) = amm.get_btc_usd_price_entry_at_or_before_height(height) {
                 if h == height && price > 0 {
                     return ok(h, price, "ammdata_index", None);
                 }
@@ -673,24 +671,24 @@ impl FairmintsProvider {
                 }
             };
 
-            let outpoint_id = match resolve_outpoint_id_v2(essentials, StateAt::Latest, &txid_bytes, vout)
-            {
-                Ok(Some(id)) => id,
-                Ok(None) => {
-                    results.insert(
-                        outpoint_str.clone(),
-                        json!({"error": "outpoint_not_found", "spent": null}),
-                    );
-                    continue;
-                }
-                Err(_) => {
-                    results.insert(
-                        outpoint_str.clone(),
-                        json!({"error": "lookup_error", "spent": null}),
-                    );
-                    continue;
-                }
-            };
+            let outpoint_id =
+                match resolve_outpoint_id_v2(essentials, StateAt::Latest, &txid_bytes, vout) {
+                    Ok(Some(id)) => id,
+                    Ok(None) => {
+                        results.insert(
+                            outpoint_str.clone(),
+                            json!({"error": "outpoint_not_found", "spent": null}),
+                        );
+                        continue;
+                    }
+                    Err(_) => {
+                        results.insert(
+                            outpoint_str.clone(),
+                            json!({"error": "lookup_error", "spent": null}),
+                        );
+                        continue;
+                    }
+                };
 
             match resolve_outpoint_spent_by_id_v2(essentials, StateAt::Latest, outpoint_id) {
                 Ok(Some(spent_txid_bytes)) => {
@@ -734,7 +732,39 @@ impl FairmintsProvider {
         let Some(summary) = load_tx_summary_v2(essentials, &txid) else {
             return json!({"ok": false, "error": "not_found"});
         };
-        self.summary_to_json(&txid, &summary)
+        let mut row = self.summary_to_json(&txid, &summary);
+        let electrum_like = get_electrum_like();
+        let balance_changes = match electrum_like.transaction_get_raw(&txid) {
+            Ok(raw) => match deserialize::<Transaction>(&raw) {
+                Ok(tx) => {
+                    let mut all_outpoints: Vec<(Txid, u32)> = Vec::new();
+                    for vin in &tx.input {
+                        if !vin.previous_output.is_null() {
+                            all_outpoints
+                                .push((vin.previous_output.txid, vin.previous_output.vout));
+                        }
+                    }
+                    for vout in 0..tx.output.len() {
+                        all_outpoints.push((txid, vout as u32));
+                    }
+                    all_outpoints.sort();
+                    all_outpoints.dedup();
+                    let outpoint_balances = get_outpoint_balances_with_spent_batch(
+                        StateAt::Latest,
+                        essentials,
+                        &all_outpoints,
+                    )
+                    .unwrap_or_default();
+                    balance_changes_json(txid, Some(&tx), &outpoint_balances)
+                }
+                Err(_) => Value::Null,
+            },
+            Err(_) => Value::Null,
+        };
+        if let Some(obj) = row.as_object_mut() {
+            obj.insert("balance_changes".into(), balance_changes);
+        }
+        row
     }
 
     fn summary_to_json(&self, txid: &Txid, summary: &AlkaneTxSummary) -> Value {
@@ -861,12 +891,11 @@ impl FairmintsProvider {
                     continue;
                 };
                 let txid = Txid::from_byte_array(blob.txid);
-                let class = self.get_tx_class(&txid).ok().flatten().unwrap_or_else(|| {
-                    StoredTxClass {
+                let class =
+                    self.get_tx_class(&txid).ok().flatten().unwrap_or_else(|| StoredTxClass {
                         tx_type: classify_transaction(&blob.traces, &[]).tx_type,
                         marketplace_info: None,
-                    }
-                });
+                    });
                 if let Some(wanted) = filter_tx_type {
                     if class.tx_type != wanted {
                         continue;
@@ -921,12 +950,9 @@ impl FairmintsProvider {
         all_outpoints.sort();
         all_outpoints.dedup();
 
-        let outpoint_balances = get_outpoint_balances_with_spent_batch(
-            StateAt::Latest,
-            essentials,
-            &all_outpoints,
-        )
-        .unwrap_or_default();
+        let outpoint_balances =
+            get_outpoint_balances_with_spent_batch(StateAt::Latest, essentials, &all_outpoints)
+                .unwrap_or_default();
 
         let mut needs_raw_tx_data: HashSet<Txid> = HashSet::new();
         let mut prev_txids_to_fetch: HashSet<Txid> = HashSet::new();
@@ -978,12 +1004,7 @@ impl FairmintsProvider {
                 if needs_raw_tx_data.contains(txid) {
                     obj.insert(
                         "raw_tx_data".into(),
-                        raw_tx_data_json(
-                            decoded_txs.get(txid),
-                            &prev_txs,
-                            network,
-                            block_time,
-                        ),
+                        raw_tx_data_json(decoded_txs.get(txid), &prev_txs, network, block_time),
                     );
                 } else {
                     obj.insert("raw_tx_data".into(), Value::Null);
@@ -1032,7 +1053,9 @@ impl FairmintsProvider {
             let diesel_entries: Vec<MempoolBlockTx> =
                 get_mempool_index_transactions_ordered_by_block_and_fee()
                     .into_iter()
-                    .filter(|tx| tx.traces.as_ref().map_or(false, |t| !t.is_empty()) && is_diesel(tx))
+                    .filter(|tx| {
+                        tx.traces.as_ref().map_or(false, |t| !t.is_empty()) && is_diesel(tx)
+                    })
                     .collect();
             let diesel_total = diesel_entries.len();
             let diesel_page: Vec<MempoolBlockTx> =
@@ -1055,8 +1078,8 @@ impl FairmintsProvider {
         }
 
         if next_block_only {
-            let template = get_mempool_block_detail(0, 1, 1, MempoolTxFilter::All, false)
-                .map(|d| d.template);
+            let template =
+                get_mempool_block_detail(0, 1, 1, MempoolTxFilter::All, false).map(|d| d.template);
             let block_txs = get_mempool_block_ordered_transactions(0).unwrap_or_default();
             let mut diesel_entries = Vec::new();
             let mut other_entries = Vec::new();
@@ -1091,11 +1114,7 @@ impl FairmintsProvider {
                 HashMap::new()
             } else {
                 let rows = self.mempool_txs_to_json(essentials, &combined)?;
-                combined
-                    .iter()
-                    .zip(rows.into_iter())
-                    .map(|(tx, row)| (tx.txid, row))
-                    .collect()
+                combined.iter().zip(rows.into_iter()).map(|(tx, row)| (tx.txid, row)).collect()
             };
             let diesel_txs: Vec<Value> =
                 diesel_page.iter().filter_map(|tx| all_json.get(&tx.txid).cloned()).collect();
@@ -1170,12 +1189,9 @@ impl FairmintsProvider {
         }
         all_outpoints.sort();
         all_outpoints.dedup();
-        let outpoint_balances = get_outpoint_balances_with_spent_batch(
-            StateAt::Latest,
-            essentials,
-            &all_outpoints,
-        )
-        .unwrap_or_default();
+        let outpoint_balances =
+            get_outpoint_balances_with_spent_batch(StateAt::Latest, essentials, &all_outpoints)
+                .unwrap_or_default();
 
         let electrum_like = get_electrum_like();
         let mut prev_txids: HashSet<Txid> = HashSet::new();
@@ -1193,7 +1209,9 @@ impl FairmintsProvider {
                 .iter()
                 .enumerate()
                 .filter_map(|(idx, txid)| {
-                    raw.get(idx).and_then(|b| deserialize::<Transaction>(b).ok()).map(|tx| (*txid, tx))
+                    raw.get(idx)
+                        .and_then(|b| deserialize::<Transaction>(b).ok())
+                        .map(|tx| (*txid, tx))
                 })
                 .collect()
         } else {
@@ -1429,4 +1447,3 @@ pub fn classify_block_transaction(
         .collect();
     classify_transaction(traces, &outputs)
 }
-

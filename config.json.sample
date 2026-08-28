@@ -72,6 +72,13 @@
     "runes": {
       "enable": false,
       "load_live_outpoints": true
+    },
+    "fairmints": {
+      "coingecko": {
+        "api_url": "https://pro-api.coingecko.com",
+        "api_key": "YOUR_KEY",
+        "timeout_secs": 10
+      }
     }
   }
 }

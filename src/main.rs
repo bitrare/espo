@@ -66,6 +66,7 @@ use crate::config::{DebugBackupConfig, get_block_source, init_block_source};
 use crate::config::get_network;
 use crate::modules::ammdata::main::AmmData;
 use crate::modules::essentials::main::Essentials;
+use crate::modules::fairmints::main::Fairmints;
 use crate::modules::essentials::storage::{
     EssentialsProvider, GetBlockSummaryParams, cache_block_summary, preload_block_summary_cache,
 };
@@ -1171,6 +1172,11 @@ async fn main() -> Result<()> {
         eprintln!("[modules] runes disabled (requires modules.runes.enable=true)");
     }
     mods.register_module(TokenData::new());
+    if get_module_config("fairmints").is_some() {
+        mods.register_module(Fairmints::new());
+    } else {
+        eprintln!("[modules] fairmints disabled (missing config)");
+    }
     if get_module_config("subfrost").is_some() {
         mods.register_module(Subfrost::new());
     } else {

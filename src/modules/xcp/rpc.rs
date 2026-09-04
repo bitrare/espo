@@ -75,5 +75,51 @@ pub fn register_rpc(reg: RpcNsRegistrar) {
             }
         })
         .await;
+        reg.register("get_address_balances", move |_cx, payload| async move {
+            let Some(address) = payload
+                .get("address")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                return json!({ "ok": false, "error": "address required" });
+            };
+            let address = address.to_string();
+            let asset = payload
+                .get("asset")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
+            let lookup = address.clone();
+            let filter = asset.clone();
+            match tokio::task::spawn_blocking(move || {
+                super::core::fetch_address_balances_filtered(&lookup, filter.as_deref())
+            })
+            .await
+            {
+                Ok(super::core::CoreFetch::Ok(items)) => {
+                    let balances = items
+                        .iter()
+                        .map(|item| (item.asset.clone(), json!(item.quantity_normalized)))
+                        .collect::<serde_json::Map<String, serde_json::Value>>();
+                    json!({
+                        "ok": true,
+                        "address": address,
+                        "asset": asset,
+                        "balances": balances,
+                        "items": items.iter().map(super::core::AddressAssetBalance::to_api).collect::<Vec<_>>(),
+                    })
+                }
+                Ok(super::core::CoreFetch::NotFound) => {
+                    json!({ "ok": true, "address": address, "asset": asset, "balances": {}, "items": [] })
+                }
+                Ok(super::core::CoreFetch::Unreachable) => {
+                    json!({ "ok": false, "address": address, "error": "unreachable" })
+                }
+                Err(e) => json!({ "ok": false, "address": address, "error": e.to_string() }),
+            }
+        })
+        .await;
     });
 }

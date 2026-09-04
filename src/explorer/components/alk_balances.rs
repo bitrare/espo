@@ -4,11 +4,13 @@ use maud::{Markup, html};
 
 use crate::explorer::components::rune_icon::rune_icon;
 use crate::explorer::components::tx_view::{AlkaneMetaCache, alkane_meta, icon_bg_style};
-use crate::explorer::pages::common::{fmt_alkane_amount, fmt_scaled_amount};
+use crate::explorer::pages::common::{fmt_alkane_amount, fmt_scaled_amount, format_integer};
 use crate::explorer::paths::explorer_path;
 use crate::explorer::phishing::is_phishing_alkane;
 use crate::modules::essentials::storage::BalanceEntry;
 use crate::modules::runes::storage::{RunesProvider, SchemaRuneId};
+use crate::modules::xcp::core::AddressAssetBalance;
+use crate::modules::xcp::display::asset_letter;
 use crate::runtime::mdb::Mdb;
 
 pub fn render_alkane_balance_cards(entries: &[BalanceEntry], essentials_mdb: &Mdb) -> Markup {
@@ -78,6 +80,41 @@ pub fn render_rune_balance_cards(
                         }
                         span class="alk-amt mono" { (amount) }
                         a class="alk-sym link mono" href=(explorer_path(&format!("/rune/{id_s}"))) {
+                            (label)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub fn render_xcp_balance_cards(entries: &[AddressAssetBalance]) -> Markup {
+    if entries.is_empty() {
+        return html! {};
+    }
+
+    html! {
+        div class="io-alkanes io-alkanes-grid" {
+            @for entry in entries {
+                @let amount = if entry.divisible {
+                    fmt_scaled_amount(entry.quantity, 8)
+                } else {
+                    format_integer(entry.quantity)
+                };
+                @let label = entry
+                    .longname
+                    .as_deref()
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or(entry.asset.as_str());
+                @let letter = asset_letter(&entry.asset).to_string();
+                div class="alk-card" {
+                    div class="alk-line" {
+                        div class="alk-icon-wrap" aria-hidden="true" {
+                            span class="alk-icon-letter" { (letter) }
+                        }
+                        span class="alk-amt mono" { (amount) }
+                        a class="alk-sym link mono" href=(explorer_path(&format!("/counterparty/asset/{}", entry.asset))) {
                             (label)
                         }
                     }

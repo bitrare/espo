@@ -1786,7 +1786,7 @@ fn docs_modules() -> Vec<ModuleDoc> {
         ModuleDoc {
             slug: "xcp-rpc",
             title: "Counterparty JSON-RPC",
-            intro: "Thin Counterparty overlay. Espo does not re-index the XCP ledger; xcp.get_tx and xcp.get_asset read a local Counterparty Core API and the explorer also RC4-decodes classic OP_RETURN payloads.",
+            intro: "Thin Counterparty overlay. Espo does not re-index the XCP ledger; xcp.get_tx, xcp.get_asset, and xcp.get_address_balances read a local Counterparty Core API and the explorer also RC4-decodes classic OP_RETURN payloads.",
             methods: vec![
                 rpc_doc(
                     "xcp.get_tx",
@@ -1833,6 +1833,23 @@ fn docs_modules() -> Vec<ModuleDoc> {
                             "supply_normalized": "2586925.31471873",
                             "description": "The Counterparty protocol native currency"
                         }
+                    }),
+                ),
+                rpc_doc(
+                    "xcp.get_address_balances",
+                    "Returns non-zero Counterparty asset balances for a Bitcoin address, including taproot. XCP is first, then remaining assets by quantity. Optional asset limits the result to one name. Fail-open when Core is unreachable. The explorer page is /address/{address}.",
+                    json!({ "address": "bc1pwufsn2zc63ttglsngtdyud4lyp9q23u44z3cjqe9yj8wllfq702qhp4dj9" }),
+                    json!({
+                        "ok": true,
+                        "address": "bc1pwufsn2zc63ttglsngtdyud4lyp9q23u44z3cjqe9yj8wllfq702qhp4dj9",
+                        "balances": { "XCP": "1312.00000000" },
+                        "items": [{
+                            "asset": "XCP",
+                            "asset_longname": null,
+                            "quantity": "131200000000",
+                            "quantity_normalized": "1312.00000000",
+                            "divisible": true
+                        }]
                     }),
                 ),
             ],

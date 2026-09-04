@@ -8,6 +8,7 @@ use bitcoin::hashes::Hash;
 use bitcoin::{Address, Network, Transaction, Txid};
 use maud::{Markup, PreEscaped, html};
 use serde::Deserialize;
+use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -17,7 +18,7 @@ use crate::alkanes::trace::{EspoSandshrewLikeTrace, EspoTrace};
 use crate::config::{get_config, get_electrum_like};
 use crate::explorer::api::cached_bitcoin_chain_tip_height;
 use crate::explorer::components::alk_balances::{
-    render_alkane_balance_cards, render_rune_balance_cards,
+    render_alkane_balance_cards, render_rune_balance_cards, render_xcp_balance_cards,
 };
 use crate::explorer::components::dropdown::{DropdownItem, DropdownProps, dropdown};
 use crate::explorer::components::header::{HeaderProps, HeaderSummaryItem, header, header_scripts};
@@ -70,6 +71,7 @@ enum TxFilter {
     Action,
     Alkane,
     Rune,
+    Xcp,
 }
 
 impl TxFilter {
@@ -78,6 +80,7 @@ impl TxFilter {
             Some("all") => Self::All,
             Some("action") | Some("actions") | Some("all_actions") => Self::Action,
             Some("rune") | Some("runes") => Self::Rune,
+            Some("xcp") | Some("counterparty") => Self::Xcp,
             Some("alkane") | Some("alkanes") => Self::Alkane,
             _ => {
                 let traces_only =
@@ -93,6 +96,7 @@ impl TxFilter {
             Self::Action => "actions",
             Self::Alkane => "alkane",
             Self::Rune => "rune",
+            Self::Xcp => "xcp",
         }
     }
 }
@@ -105,6 +109,14 @@ struct AddressTxRender {
     position: Option<MempoolProjectedPosition>,
     confirmations: Option<u64>,
     is_mempool: bool,
+    xcp_core: Option<Value>,
+}
+
+#[derive(Clone)]
+struct ActionCandidate {
+    txid: Txid,
+    height: u32,
+    xcp_core: Option<Value>,
 }
 
 #[derive(Clone)]
@@ -288,17 +300,25 @@ pub async fn address_page(
     let page = q.page.unwrap_or(1).max(1);
     let limit = q.limit.unwrap_or(DEFAULT_PAGE_LIMIT).clamp(1, MAX_PAGE_LIMIT);
     let runes_enabled = runes_enabled_from_global_config();
-    let requested_filter = if runes_enabled && q.txs.is_none() && q.traces.is_none() {
+    let xcp_enabled = crate::modules::xcp::config::XcpConfig::enabled();
+    let requested_filter = if (runes_enabled || xcp_enabled) && q.txs.is_none() && q.traces.is_none()
+    {
         TxFilter::Action
     } else {
         TxFilter::from_query(q.txs.as_deref(), q.traces.as_deref())
     };
-    let tx_filter =
-        if !runes_enabled && matches!(requested_filter, TxFilter::Rune | TxFilter::Action) {
-            TxFilter::Alkane
-        } else {
-            requested_filter
-        };
+    let tx_filter = match requested_filter {
+        TxFilter::Rune if !runes_enabled => TxFilter::Alkane,
+        TxFilter::Xcp if !xcp_enabled => {
+            if runes_enabled {
+                TxFilter::Action
+            } else {
+                TxFilter::Alkane
+            }
+        }
+        TxFilter::Action if !runes_enabled && !xcp_enabled => TxFilter::Alkane,
+        other => other,
+    };
     let traces_only = tx_filter == TxFilter::Alkane;
     let txs_param = tx_filter.query_value();
     let all_range_label = if current_language().is_chinese() { "全部" } else { "All" };
@@ -377,6 +397,68 @@ pub async fn address_page(
         "runes.get_address_balances",
         rune_balances_t0,
         &format!("runes={}", rune_balance_entries.len()),
+    );
+
+    let xcp_balances_t0 = Instant::now();
+    let xcp_balance_entries = if xcp_enabled {
+        let address_for_xcp = address_str.clone();
+        match tokio::task::spawn_blocking(move || {
+            crate::modules::xcp::core::fetch_address_balances(&address_for_xcp)
+        })
+        .await
+        {
+            Ok(crate::modules::xcp::core::CoreFetch::Ok(items)) => items,
+            Ok(crate::modules::xcp::core::CoreFetch::Unreachable) => {
+                eprintln!("[address_page] xcp core unreachable for {address_str}");
+                Vec::new()
+            }
+            Ok(_) => Vec::new(),
+            Err(err) => {
+                eprintln!("[address_page] xcp balance task failed for {address_str}: {err}");
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    log_address_page_perf(
+        &address_str,
+        "xcp.get_address_balances",
+        xcp_balances_t0,
+        &format!("xcp={}", xcp_balance_entries.len()),
+    );
+
+    let xcp_txs_t0 = Instant::now();
+    let xcp_address_txs = if xcp_enabled {
+        let address_for_xcp = address_str.clone();
+        match tokio::task::spawn_blocking(move || {
+            crate::modules::xcp::core::fetch_address_transactions(&address_for_xcp)
+        })
+        .await
+        {
+            Ok(crate::modules::xcp::core::CoreFetch::Ok(items)) => items,
+            Ok(crate::modules::xcp::core::CoreFetch::Unreachable) => {
+                eprintln!("[address_page] xcp txs unreachable for {address_str}");
+                Vec::new()
+            }
+            Ok(_) => Vec::new(),
+            Err(err) => {
+                eprintln!("[address_page] xcp tx task failed for {address_str}: {err}");
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    let xcp_by_txid: HashMap<Txid, Value> = xcp_address_txs
+        .iter()
+        .filter_map(|item| Txid::from_str(&item.txid).ok().map(|txid| (txid, item.raw.clone())))
+        .collect();
+    log_address_page_perf(
+        &address_str,
+        "xcp.get_address_transactions",
+        xcp_txs_t0,
+        &format!("xcp_txs={}", xcp_address_txs.len()),
     );
 
     let chart_tokens_t0 = Instant::now();
@@ -517,6 +599,7 @@ pub async fn address_page(
             position: entry.position.clone(),
             confirmations: None,
             is_mempool: true,
+            xcp_core: xcp_by_txid.get(&entry.txid).cloned(),
         });
     }
 
@@ -526,69 +609,164 @@ pub async fn address_page(
     let mut next_cursor: Option<Txid> = None;
     if tx_filter == TxFilter::Action {
         let confirmed_total_t0 = Instant::now();
-        let confirmed_total =
-            runes_provider.get_action_address_tx_count(&address_str).unwrap_or(0) as usize;
+        let action_total = if runes_enabled {
+            runes_provider.get_action_address_tx_count(&address_str).unwrap_or(0) as usize
+        } else {
+            0
+        };
+        let xcp_total = xcp_address_txs.len();
+        let confirmed_total = action_total.saturating_add(xcp_total);
         log_address_page_perf(
             &address_str,
-            "runes.get_action_address_tx_count",
+            "actions.combined_counts",
             confirmed_total_t0,
-            &format!("confirmed_total={}", confirmed_total),
+            &format!("action_total={} xcp_total={}", action_total, xcp_total),
         );
-        let confirmed_slice_start = confirmed_offset.min(confirmed_total);
-        let confirmed_slice_end = (confirmed_offset + remaining_slots).min(confirmed_total);
+        let window = confirmed_offset.saturating_add(remaining_slots);
+        let mut candidates: HashMap<Txid, ActionCandidate> = HashMap::new();
 
-        if confirmed_slice_end > confirmed_slice_start {
-            let range_start = confirmed_total.saturating_sub(confirmed_slice_end) as u64;
-            let range_end = confirmed_total.saturating_sub(confirmed_slice_start) as u64;
+        if runes_enabled && action_total > 0 && window > 0 {
+            let take = window.min(action_total);
+            let range_start = action_total.saturating_sub(take) as u64;
+            let range_end = action_total as u64;
             let pointers = runes_provider
                 .get_action_address_tx_range(&address_str, range_start, range_end)
                 .unwrap_or_default();
-            let pointers: Vec<_> = pointers.into_iter().rev().collect();
-            let txids: Vec<Txid> =
-                pointers.iter().map(|pointer| Txid::from_byte_array(pointer.txid)).collect();
-
-            let raw_txs_t0 = Instant::now();
-            let raw_txs = electrum_like.batch_transaction_get_raw(&txids).unwrap_or_default();
-            log_address_page_perf(
-                &address_str,
-                "electrum_like.batch_transaction_get_raw.action_txs",
-                raw_txs_t0,
-                &format!("txids={} raws={}", txids.len(), raw_txs.len()),
-            );
-
-            for (idx, txid) in txids.iter().enumerate() {
-                let raw = raw_txs.get(idx).cloned().unwrap_or_default();
-                if raw.is_empty() {
-                    continue;
-                }
-                let tx: Transaction = match deserialize(&raw) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        eprintln!("[address_page] failed to decode action tx {}: {e}", txid);
-                        continue;
-                    }
-                };
-                let summary = load_tx_summary_v2(&essentials_provider, txid);
-                let confirmations = pointers.get(idx).and_then(|pointer| {
-                    let h = pointer.height as u64;
-                    chain_tip.and_then(|tip| if tip >= h { Some(tip - h + 1) } else { None })
-                });
-                let traces = summary
-                    .as_ref()
-                    .map(|s| traces_from_summary(txid, s))
-                    .filter(|t| !t.is_empty());
-                tx_renders.push(AddressTxRender {
-                    txid: *txid,
-                    tx,
-                    traces,
-                    rune_io: None,
-                    position: None,
-                    confirmations,
-                    is_mempool: false,
-                });
+            for pointer in pointers.into_iter().rev() {
+                let txid = Txid::from_byte_array(pointer.txid);
+                candidates.insert(
+                    txid,
+                    ActionCandidate {
+                        txid,
+                        height: pointer.height,
+                        xcp_core: xcp_by_txid.get(&txid).cloned(),
+                    },
+                );
             }
         }
 
+        for item in xcp_address_txs.iter().take(window) {
+            let Ok(txid) = Txid::from_str(&item.txid) else {
+                continue;
+            };
+            candidates
+                .entry(txid)
+                .and_modify(|existing| {
+                    if existing.xcp_core.is_none() {
+                        existing.xcp_core = Some(item.raw.clone());
+                    }
+                })
+                .or_insert(ActionCandidate {
+                    txid,
+                    height: item.block_index,
+                    xcp_core: Some(item.raw.clone()),
+                });
+        }
+
+        let mut merged: Vec<ActionCandidate> = candidates.into_values().collect();
+        merged.sort_by(|a, b| b.height.cmp(&a.height).then_with(|| b.txid.cmp(&a.txid)));
+        let page_items: Vec<ActionCandidate> =
+            merged.into_iter().skip(confirmed_offset).take(remaining_slots).collect();
+        let txids: Vec<Txid> = page_items.iter().map(|item| item.txid).collect();
+
+        let raw_txs_t0 = Instant::now();
+        let raw_txs = electrum_like.batch_transaction_get_raw(&txids).unwrap_or_default();
+        log_address_page_perf(
+            &address_str,
+            "electrum_like.batch_transaction_get_raw.action_txs",
+            raw_txs_t0,
+            &format!("txids={} raws={}", txids.len(), raw_txs.len()),
+        );
+
+        for (idx, item) in page_items.iter().enumerate() {
+            let raw = raw_txs.get(idx).cloned().unwrap_or_default();
+            if raw.is_empty() {
+                continue;
+            }
+            let tx: Transaction = match deserialize(&raw) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("[address_page] failed to decode action tx {}: {e}", item.txid);
+                    continue;
+                }
+            };
+            let summary = load_tx_summary_v2(&essentials_provider, &item.txid);
+            let confirmations = chain_tip.and_then(|tip| {
+                let h = item.height as u64;
+                if tip >= h { Some(tip - h + 1) } else { None }
+            });
+            let traces = summary
+                .as_ref()
+                .map(|s| traces_from_summary(&item.txid, s))
+                .filter(|t| !t.is_empty());
+            tx_renders.push(AddressTxRender {
+                txid: item.txid,
+                tx,
+                traces,
+                rune_io: None,
+                position: None,
+                confirmations,
+                is_mempool: false,
+                xcp_core: item.xcp_core.clone(),
+            });
+        }
+
+        tx_total = pending_total + confirmed_total;
+        tx_has_next = (off + tx_renders.len()) < tx_total;
+    } else if tx_filter == TxFilter::Xcp {
+        let confirmed_total = xcp_address_txs.len();
+        let page_items: Vec<&crate::modules::xcp::core::AddressTransaction> = xcp_address_txs
+            .iter()
+            .skip(confirmed_offset)
+            .take(remaining_slots)
+            .collect();
+        let txids: Vec<Txid> = page_items
+            .iter()
+            .filter_map(|item| Txid::from_str(&item.txid).ok())
+            .collect();
+        let raw_txs_t0 = Instant::now();
+        let raw_txs = electrum_like.batch_transaction_get_raw(&txids).unwrap_or_default();
+        log_address_page_perf(
+            &address_str,
+            "electrum_like.batch_transaction_get_raw.xcp_txs",
+            raw_txs_t0,
+            &format!("txids={} raws={}", txids.len(), raw_txs.len()),
+        );
+        for (idx, item) in page_items.iter().enumerate() {
+            let Some(txid) = Txid::from_str(&item.txid).ok() else {
+                continue;
+            };
+            let raw = raw_txs.get(idx).cloned().unwrap_or_default();
+            if raw.is_empty() {
+                continue;
+            }
+            let tx: Transaction = match deserialize(&raw) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("[address_page] failed to decode xcp tx {}: {e}", txid);
+                    continue;
+                }
+            };
+            let summary = load_tx_summary_v2(&essentials_provider, &txid);
+            let confirmations = chain_tip.and_then(|tip| {
+                let h = item.block_index as u64;
+                if tip >= h { Some(tip - h + 1) } else { None }
+            });
+            let traces = summary
+                .as_ref()
+                .map(|s| traces_from_summary(&txid, s))
+                .filter(|t| !t.is_empty());
+            tx_renders.push(AddressTxRender {
+                txid,
+                tx,
+                traces,
+                rune_io: None,
+                position: None,
+                confirmations,
+                is_mempool: false,
+                xcp_core: Some(item.raw.clone()),
+            });
+        }
         tx_total = pending_total + confirmed_total;
         tx_has_next = (off + tx_renders.len()) < tx_total;
     } else if tx_filter == TxFilter::Alkane {
@@ -687,6 +865,7 @@ pub async fn address_page(
                     position: None,
                     confirmations,
                     is_mempool: false,
+                    xcp_core: xcp_by_txid.get(txid).cloned(),
                 });
             }
             log_address_page_perf(
@@ -778,6 +957,7 @@ pub async fn address_page(
                     position: None,
                     confirmations,
                     is_mempool: false,
+                    xcp_core: xcp_by_txid.get(txid).cloned(),
                 });
             }
         }
@@ -877,6 +1057,7 @@ pub async fn address_page(
                                 position: None,
                                 confirmations,
                                 is_mempool: false,
+                                xcp_core: xcp_by_txid.get(&entry.txid).cloned(),
                             });
                         }
                         log_address_page_perf(
@@ -1183,6 +1364,15 @@ pub async fn address_page(
         &format!("entries={}", rune_balance_entries.len()),
     );
 
+    let xcp_balances_markup_t0 = Instant::now();
+    let xcp_balances_markup = render_xcp_balance_cards(&xcp_balance_entries);
+    log_address_page_perf(
+        &address_str,
+        "render_xcp_balance_cards",
+        xcp_balances_markup_t0,
+        &format!("entries={}", xcp_balance_entries.len()),
+    );
+
     let mut summary_items: Vec<HeaderSummaryItem> = Vec::new();
     summary_items.push(HeaderSummaryItem {
         label: "Confirmed balance".to_string(),
@@ -1258,6 +1448,7 @@ pub async fn address_page(
         TxFilter::Action => "All Actions",
         TxFilter::Alkane => "Only Alkanes",
         TxFilter::Rune => "Only Runes",
+        TxFilter::Xcp => "Only Counterparty",
     };
     let mut tx_filter_dropdown_items = vec![
         DropdownItem {
@@ -1276,7 +1467,7 @@ pub async fn address_page(
             selected: tx_filter == TxFilter::Alkane,
         },
     ];
-    if runes_enabled {
+    if runes_enabled || xcp_enabled {
         tx_filter_dropdown_items.insert(
             1,
             DropdownItem {
@@ -1289,11 +1480,21 @@ pub async fn address_page(
                 selected: tx_filter == TxFilter::Action,
             },
         );
+    }
+    if runes_enabled {
         tx_filter_dropdown_items.push(DropdownItem {
             label: "Only Runes".to_string(),
             href: explorer_path(&format!("/address/{}?page=1&limit={limit}&txs=rune", address_str)),
             icon: None,
             selected: tx_filter == TxFilter::Rune,
+        });
+    }
+    if xcp_enabled {
+        tx_filter_dropdown_items.push(DropdownItem {
+            label: "Only Counterparty".to_string(),
+            href: explorer_path(&format!("/address/{}?page=1&limit={limit}&txs=xcp", address_str)),
+            icon: None,
+            selected: tx_filter == TxFilter::Xcp,
         });
     }
     let tx_filter_dropdown = dropdown(DropdownProps {
@@ -1319,6 +1520,11 @@ pub async fn address_page(
                             (icon_arrow_up_right())
                         }
                     }
+                }
+
+                @if !xcp_balance_entries.is_empty() {
+                    h2 class="h2 address-subtitle" { "Counterparty Balances" }
+                    (xcp_balances_markup)
                 }
 
                 @if !rune_balance_entries.is_empty() {
@@ -1451,7 +1657,7 @@ pub async fn address_page(
                                 href=(explorer_path(&format!("/address/{}?page=1&limit={limit}&txs=all", address_str))) {
                                 "All Txs"
                             }
-                            @if runes_enabled {
+                            @if runes_enabled || xcp_enabled {
                                 a class=(if tx_filter == TxFilter::Action { "segment active" } else { "segment" })
                                     href=(explorer_path(&format!("/address/{}?page=1&limit={limit}&txs=actions", address_str))) {
                                     "All Actions"
@@ -1465,6 +1671,12 @@ pub async fn address_page(
                                 a class=(if tx_filter == TxFilter::Rune { "segment active" } else { "segment" })
                                     href=(explorer_path(&format!("/address/{}?page=1&limit={limit}&txs=rune", address_str))) {
                                     "Only Runes"
+                                }
+                            }
+                            @if xcp_enabled {
+                                a class=(if tx_filter == TxFilter::Xcp { "segment active" } else { "segment" })
+                                    href=(explorer_path(&format!("/address/{}?page=1&limit={limit}&txs=xcp", address_str))) {
+                                    "Only Counterparty"
                                 }
                             }
                         }
@@ -1500,7 +1712,7 @@ pub async fn address_page(
                                 } else {
                                     None
                                 };
-                                (render_tx(&item.txid, &item.tx, traces_ref, state.network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb, pill, None, projected_balances, projected_rune_io, true, false, None))
+                                (render_tx(&item.txid, &item.tx, traces_ref, state.network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb, pill, None, projected_balances, projected_rune_io, true, false, item.xcp_core.as_ref()))
                             }
                         }
 

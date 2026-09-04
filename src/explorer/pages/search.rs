@@ -41,6 +41,21 @@ pub async fn search(Query(q): Query<SearchQuery>) -> Response {
         }
     }
 
+    if crate::modules::xcp::config::XcpConfig::enabled()
+        && crate::modules::xcp::core::looks_like_asset_query(&query)
+    {
+        let lookup = query.clone();
+        if let Ok(crate::modules::xcp::core::CoreFetch::Ok(asset)) =
+            tokio::task::spawn_blocking(move || crate::modules::xcp::core::fetch_asset(&lookup))
+                .await
+        {
+            if let Some(name) = crate::modules::xcp::core::asset_name_from_value(&asset) {
+                return Redirect::to(&explorer_path(&format!("/counterparty/asset/{name}")))
+                    .into_response();
+            }
+        }
+    }
+
     if let Ok(addr) = Address::from_str(&query) {
         if let Ok(addr) = addr.require_network(get_network()) {
             return Redirect::to(&explorer_path(&format!("/address/{addr}"))).into_response();

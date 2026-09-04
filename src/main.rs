@@ -76,6 +76,7 @@ use crate::modules::runes::main::{Runes, runes_enabled_from_global_config};
 use crate::modules::runes::storage::RunesProvider;
 use crate::modules::subfrost::main::Subfrost;
 use crate::modules::tokendata::main::TokenData;
+use crate::modules::xcp::main::Xcp;
 use crate::utils::{EtaTracker, fmt_duration};
 use anyhow::{Context, Result};
 
@@ -1186,6 +1187,11 @@ async fn main() -> Result<()> {
         mods.register_module(OylApi::new());
     } else {
         eprintln!("[modules] oylapi disabled (missing config)");
+    }
+    if get_module_config("xcp").is_some() {
+        mods.register_module(Xcp::new());
+    } else {
+        eprintln!("[modules] xcp disabled (missing config)");
     }
     // mods.register_module(TracesData::new());
 

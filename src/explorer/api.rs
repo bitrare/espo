@@ -823,6 +823,7 @@ pub async fn search_guess(Query(q): Query<SearchGuessQuery>) -> Json<SearchGuess
     let mut seen_runes: HashSet<SchemaRuneId> = HashSet::new();
     let mut txid: Vec<SearchGuessItem> = Vec::new();
     let mut addresses: Vec<SearchGuessItem> = Vec::new();
+    let mut xcp_assets: Vec<SearchGuessItem> = Vec::new();
     // Resolved from the data instance in client mode (no local modules config).
     let search_cfg = crate::modules::ammdata::internal_rpc::explorer_amm_config();
     let search_index_enabled = search_cfg.search_index_enabled;
@@ -1222,6 +1223,28 @@ pub async fn search_guess(Query(q): Query<SearchGuessQuery>) -> Json<SearchGuess
             items: runes,
         });
     }
+    if crate::modules::xcp::config::XcpConfig::enabled()
+        && crate::modules::xcp::core::looks_like_asset_query(&query)
+    {
+        let lookup = query.clone();
+        if let Ok(crate::modules::xcp::core::CoreFetch::Ok(asset)) =
+            tokio::task::spawn_blocking(move || crate::modules::xcp::core::fetch_asset(&lookup))
+                .await
+        {
+            if let Some(name) = crate::modules::xcp::core::asset_name_from_value(&asset) {
+                xcp_assets.push(SearchGuessItem {
+                    label: name.clone(),
+                    value: name.clone(),
+                    href: Some(explorer_path(&format!("/counterparty/asset/{name}"))),
+                    icon_url: None,
+                    fallback_letter: Some(
+                        crate::modules::xcp::display::asset_letter(&name).to_string(),
+                    ),
+                });
+            }
+        }
+    }
+
     if !txid.is_empty() {
         groups.push(SearchGuessGroup {
             kind: "transactions".to_string(),
@@ -1234,6 +1257,13 @@ pub async fn search_guess(Query(q): Query<SearchGuessQuery>) -> Json<SearchGuess
             kind: "addresses".to_string(),
             title: "Addresses".to_string(),
             items: addresses,
+        });
+    }
+    if !xcp_assets.is_empty() {
+        groups.push(SearchGuessGroup {
+            kind: "counterparty".to_string(),
+            title: "Counterparty".to_string(),
+            items: xcp_assets,
         });
     }
 

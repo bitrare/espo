@@ -764,6 +764,8 @@ pub async fn tx_page(State(state): State<ExplorerState>, Path(txid_str): Path<St
     let projected_rune_io =
         if tx_height.is_none() { mempool_projected_rune_io.as_ref() } else { None };
 
+    let xcp_core = crate::modules::xcp::core::fetch_transaction(&txid_hex);
+
     let mut summary_items: Vec<HeaderSummaryItem> = Vec::new();
     summary_items.push(HeaderSummaryItem {
         label: "Timestamp".to_string(),
@@ -835,7 +837,7 @@ pub async fn tx_page(State(state): State<ExplorerState>, Path(txid_str): Path<St
                     }
                 }
                 h2 class="h2" { "Inputs & Outputs" }
-                (render_tx(&txid, &tx, traces_ref, state.network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb, tx_pill, render_fee_rate, projected_balances, projected_rune_io, false, defer_alkane_trace_status))
+                (render_tx(&txid, &tx, traces_ref, state.network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb, tx_pill, render_fee_rate, projected_balances, projected_rune_io, false, defer_alkane_trace_status, xcp_core.as_ref()))
                 (header_scripts())
             }
             (tx_event_listener_script(&txid))

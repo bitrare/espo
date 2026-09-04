@@ -315,6 +315,9 @@ fn method_detail(method: &MethodDoc) -> &'static str {
     {
         return "AMM endpoints use pool and factory ids from indexed contracts. Route calculations are informational and clients should still validate transactions before broadcast.";
     }
+    if name.contains("xcp.") {
+        return "Counterparty data is read from a local Core API. The explorer also RC4-decodes classic OP_RETURN payloads; Core supplies assets, quantities, and events that the OP_RETURN does not carry.";
+    }
     if name.contains("runes.") || name.contains("rune") {
         return "Rune endpoints are available only when the runes module is enabled and follow the Rune id and spaced-name conventions used by the indexer.";
     }
@@ -1777,6 +1780,60 @@ fn docs_modules() -> Vec<ModuleDoc> {
                     "Returns global unwrap requests, optionally filtered by fulfillment state.",
                     json!({ "count": 10, "offset": 0, "fulfilled": false }),
                     json!({ "items": [{ "request_txid": "b1267c0dcf9de9fb8a8b5bb4d34da75ae7dca36abf3361906c7f83c6e661f155", "amount": "100000", "fulfilled": false, "timestamp": 1779285102, "address_spk": "001457ca41904d01d415e7971c9658e38c47443a06e7" }], "total": 1 }),
+                ),
+            ],
+        },
+        ModuleDoc {
+            slug: "xcp-rpc",
+            title: "Counterparty JSON-RPC",
+            intro: "Thin Counterparty overlay. Espo does not re-index the XCP ledger; xcp.get_tx and xcp.get_asset read a local Counterparty Core API and the explorer also RC4-decodes classic OP_RETURN payloads.",
+            methods: vec![
+                rpc_doc(
+                    "xcp.get_tx",
+                    "Returns Counterparty Core data plus a normalized explorer view for one Bitcoin transaction. The view is optional overlay data: a tx can also carry Alkanes or Runes. Fail-open when Core is unreachable.",
+                    json!({ "txid": "6000542810cfa82b1d8ca767139cc71307d9d64348befcc2b0df2f241771500b" }),
+                    json!({
+                        "ok": true,
+                        "txid": "6000542810cfa82b1d8ca767139cc71307d9d64348befcc2b0df2f241771500b",
+                        "view": {
+                            "headline": "112 XCP bought from a dispenser for 0.00615888 BTC",
+                            "actions": [{
+                                "method": "dispense",
+                                "headline": "112 XCP bought from a dispenser for 0.00615888 BTC",
+                                "asset": "XCP",
+                                "amount": "112",
+                                "rate_btc": "0.00005499",
+                                "btc_total": "0.00615888",
+                                "status": "Settled",
+                                "buyer": "bc1pwufsn2zc63ttglsngtdyud4lyp9q23u44z3cjqe9yj8wllfq702qhp4dj9",
+                                "seller": "1DGaau3xBytkfXxgaKcoa7GRmitdfoV7hu",
+                                "dispenser_tx": "462c8c9c3ccd3fd2f234febf3c359e7ab935c0e0fba7ffee62eeeeb1321a9321",
+                                "machine_closed": true
+                            }],
+                            "transfers": [
+                                { "address": "1DGaau3xBytkfXxgaKcoa7GRmitdfoV7hu", "asset": "XCP", "amount": "112", "incoming": false },
+                                { "address": "bc1pwufsn2zc63ttglsngtdyud4lyp9q23u44z3cjqe9yj8wllfq702qhp4dj9", "asset": "XCP", "amount": "112", "incoming": true }
+                            ]
+                        }
+                    }),
+                ),
+                rpc_doc(
+                    "xcp.get_asset",
+                    "Resolves a Counterparty asset by name, numeric id, or A-prefixed id and returns the Core asset object plus a holders count. Fail-open when Core is unreachable. The explorer page is /counterparty/asset/{asset}.",
+                    json!({ "asset": "XCP" }),
+                    json!({
+                        "ok": true,
+                        "asset": "XCP",
+                        "holders": 45414,
+                        "result": {
+                            "asset": "XCP",
+                            "divisible": true,
+                            "locked": true,
+                            "supply": 258692531471873u64,
+                            "supply_normalized": "2586925.31471873",
+                            "description": "The Counterparty protocol native currency"
+                        }
+                    }),
                 ),
             ],
         },

@@ -2537,6 +2537,68 @@ a:hover {
   font-weight: 600;
   letter-spacing: 0.2px;
 }
+.xcp-headline {
+  margin: 0;
+  font-weight: 600;
+  line-height: 1.35;
+}
+.xcp-fill-table {
+  display: grid;
+  gap: 6px;
+}
+.xcp-fill-head,
+.xcp-fill-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1.1fr) minmax(0, 0.7fr) minmax(0, 1.2fr) minmax(0, 1.2fr);
+  gap: 8px;
+  align-items: baseline;
+}
+.xcp-fill-head {
+  font-size: 12px;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+.xcp-fill-note {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: baseline;
+}
+.xcp-action-io {
+  display: grid;
+  gap: 4px;
+}
+.xcp-action-party {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.xcp-delta-table {
+  display: grid;
+  gap: 6px;
+  margin-top: 4px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border, rgba(255, 255, 255, 0.08));
+}
+.xcp-delta-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+}
+.xcp-delta-amt {
+  flex: 0 0 auto;
+  font-weight: 700;
+  white-space: nowrap;
+}
+.xcp-delta-amt.plus {
+  color: #3dd68c;
+}
+.xcp-delta-amt.minus {
+  color: #ff6b6b;
+}
 .trace-contract-row {
   display: flex;
   align-items: center;
@@ -2658,6 +2720,10 @@ a:hover {
   flex-wrap: wrap;
   gap: 8px;
   align-items: center;
+}
+a.alkane-tag {
+  text-decoration: none;
+  color: inherit;
 }
 .alkane-tag {
   display: inline-flex;

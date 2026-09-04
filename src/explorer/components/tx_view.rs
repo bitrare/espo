@@ -29,6 +29,7 @@ use crate::modules::essentials::utils::balances::{
 use crate::modules::essentials::utils::inspections::{StoredInspectionResult, load_inspection};
 use crate::modules::essentials::utils::names::display_alkane_name_and_symbol;
 use crate::modules::runes::storage::{RuneBalance, RunesProvider, TxRuneIo};
+use crate::modules::xcp::display as xcp_display;
 use crate::runtime::mdb::Mdb;
 use crate::schemas::SchemaAlkaneId;
 use ordinals::{Artifact, Runestone};
@@ -948,6 +949,7 @@ pub fn render_tx(
     projected_rune_io_override: Option<&TxRuneIo>,
     show_tx_title: bool,
     defer_alkane_trace_status: bool,
+    xcp_core: Option<&Value>,
 ) -> Markup {
     let mut alkane_meta_cache: AlkaneMetaCache = HashMap::new();
     let mut alkane_impl_cache: AlkaneImplCache = HashMap::new();
@@ -955,6 +957,7 @@ pub fn render_tx(
     let tx_rune_io = projected_rune_io_override
         .cloned()
         .or_else(|| runes_provider.get_tx_io(txid).ok().flatten());
+    let xcp_view = xcp_display::view(tx, xcp_core);
     let vins_markup = render_vins(
         tx,
         network,
@@ -1000,6 +1003,7 @@ pub fn render_tx(
         tx_rune_io.as_ref(),
         &runes_provider,
         defer_alkane_trace_status,
+        xcp_view.as_ref(),
     );
 
     html! {
@@ -1017,10 +1021,13 @@ pub fn render_tx(
                     (vouts_markup)
                 }
             }
-            @if pill.is_some() || fee_pill_label.is_some() {
+            @if pill.is_some() || fee_pill_label.is_some() || xcp_view.is_some() {
                 div class="tx-pill-row" {
                     @if let Some(fee_label) = fee_pill_label.as_ref() {
                         span class="pill tx-pill tx-pill-fee" { (fee_label) }
+                    }
+                    @if xcp_view.is_some() {
+                        span class="pill tx-pill" { "Counterparty" }
                     }
                     @if let Some(p) = pill {
                         @let tone_class = match &p.tone {
@@ -1127,6 +1134,7 @@ fn render_vouts(
     tx_rune_io: Option<&TxRuneIo>,
     runes_provider: &RunesProvider,
     defer_alkane_trace_status: bool,
+    xcp_view: Option<&xcp_display::XcpView>,
 ) -> Markup {
     let tx_bytes = txid.to_byte_array();
     let tx_hex = txid.to_string();
@@ -1177,6 +1185,7 @@ fn render_vouts(
                                         protostone_json.as_ref(),
                                         is_runestone,
                                         runestone_json.as_ref(),
+                                        if is_protostone || is_runestone { None } else { xcp_view },
                                         tx_rune_io,
                                         runes_provider,
                                         &traces_for_vout,
@@ -1230,6 +1239,7 @@ fn render_op_return(
     protostone_json: Option<&Value>,
     is_runestone: bool,
     runestone_json: Option<&Value>,
+    xcp_view: Option<&xcp_display::XcpView>,
     tx_rune_io: Option<&TxRuneIo>,
     runes_provider: &RunesProvider,
     traces: &[&EspoTrace],
@@ -1240,7 +1250,11 @@ fn render_op_return(
     defer_alkane_trace_status: bool,
 ) -> Markup {
     let fallback = opreturn_utf8(&payload.data);
-    let is_decoded_message = is_protostone || is_runestone;
+    let is_xcp = xcp_view.is_some();
+    let is_decoded_message = is_protostone || is_runestone || is_xcp;
+    let xcp_raw = xcp_view
+        .map(|view| serde_json::to_string_pretty(&view.events).unwrap_or_default())
+        .unwrap_or_default();
     let has_rune_summary = is_runestone
         && tx_rune_io
             .map(|io| io.etched.is_some() || !io.minted.is_empty())
@@ -1276,14 +1290,16 @@ fn render_op_return(
                         span class="opret-caret" aria-hidden="true" { (icon_caret_right()) }
                         span class="opret-title mono" {
                             "OP_RETURN"
-                            @if is_protostone || is_runestone {
+                            @if is_protostone || is_runestone || is_xcp {
                                 " ( "
                                 span class="opret-meta" {
                                     span class="opret-diamond" aria-hidden="true" {}
                                     @if is_protostone {
                                         " Protostone message)"
-                                    } @else {
+                                    } @else if is_runestone {
                                         " Runestone message)"
+                                    } @else {
+                                        " Counterparty message)"
                                     }
                                 }
                             }
@@ -1332,6 +1348,20 @@ fn render_op_return(
                     }
                     @if is_runestone && !has_rune_summary {
                         (render_runestone_toggle(runestone_json, &fallback))
+                    }
+                    @if let Some(xcp) = xcp_view {
+                        @for action in &xcp.actions {
+                            div class="trace-view" {
+                                (render_xcp_action(action, &xcp.transfers))
+                            }
+                        }
+                        details class="opret-toggle" {
+                            summary class="opret-toggle-summary" {
+                                span class="opret-toggle-caret" aria-hidden="true" { (icon_caret_right()) }
+                                span class="opret-toggle-label" { "Counterparty Events" }
+                            }
+                            div class="opret-toggle-body" { (json_viewer(Some(&xcp.events), &xcp_raw)) }
+                        }
                     }
                 }
             } @else {
@@ -1393,6 +1423,117 @@ fn balances_list(
 pub fn render_alkane_balances(entries: &[BalanceEntry], essentials_mdb: &Mdb) -> Markup {
     let mut cache: AlkaneMetaCache = HashMap::new();
     balances_list(entries, &mut cache, essentials_mdb, false)
+}
+
+fn render_xcp_action(action: &xcp_display::XcpAction, transfers: &[xcp_display::XcpTransfer]) -> Markup {
+    let letter = xcp_display::asset_letter(if action.asset.is_empty() { "X" } else { &action.asset });
+    let asset_label = if action.asset.is_empty() { "Counterparty".to_string() } else { action.asset.clone() };
+    let asset_href = (!action.asset.is_empty())
+        .then(|| explorer_path(&format!("/counterparty/asset/{}", action.asset)));
+    let status_class = if action.success { "success" } else { "failure" };
+    html! {
+        div class="trace-summary" {
+            span class="trace-summary-label" { "Counterparty action:" }
+            div class="trace-contract-row" {
+                div class="trace-contract-icon" aria-hidden="true" {
+                    span class="trace-icon-letter" { (letter) }
+                }
+                div class="trace-contract-meta" {
+                    @if let Some(href) = asset_href.as_ref() {
+                        a class="trace-contract-name link" href=(href) { (asset_label) }
+                    } @else {
+                        span class="trace-contract-name" { (asset_label) }
+                    }
+                }
+                span class="io-arrow" { (arrow_svg()) }
+            }
+            p class="xcp-headline" { (action.headline.clone()) }
+            @if action.amount.is_some() || action.btc_total.is_some() {
+                div class="xcp-fill-table" {
+                    div class="xcp-fill-head muted" {
+                        span { "Item" }
+                        span { "Qty" }
+                        span { "Rate" }
+                        span { "Total" }
+                    }
+                    div class="xcp-fill-row" {
+                        @if let Some(href) = asset_href.as_ref() {
+                            a class="link mono" href=(href) { (action.asset.clone()) }
+                        } @else {
+                            span class="mono" { "—" }
+                        }
+                        span class="mono" { (action.amount.clone().unwrap_or_else(|| "—".to_string())) }
+                        span class="mono" {
+                            (action.rate_btc.as_ref().map(|rate| format!("{rate} BTC")).unwrap_or_else(|| "—".to_string()))
+                        }
+                        span class="mono" {
+                            (action.btc_total.as_ref().map(|total| format!("{total} BTC")).unwrap_or_else(|| "—".to_string()))
+                        }
+                    }
+                    @if let Some(dispenser_tx) = action.dispenser_tx.as_ref() {
+                        div class="xcp-fill-note" {
+                            a class="link mono" href=(explorer_path(&format!("/tx/{dispenser_tx}"))) {
+                                (format!("machine {}", xcp_display::short_hash(dispenser_tx)))
+                            }
+                            @if action.machine_closed {
+                                span class="muted" { " closed" }
+                            }
+                        }
+                    }
+                }
+            }
+            @if action.buyer.is_some() || action.seller.is_some() {
+                div class="xcp-action-io" {
+                    @if let Some(buyer) = action.buyer.as_ref() {
+                        @let (prefix, suffix) = addr_prefix_suffix(buyer);
+                        div class="xcp-action-party" {
+                            span class="muted" { "Buyer" }
+                            a class="link mono addr-inline" href=(explorer_path(&format!("/address/{buyer}"))) {
+                                span class="addr-prefix" { (prefix) }
+                                span class="addr-suffix" { (suffix) }
+                            }
+                        }
+                    }
+                    @if let Some(seller) = action.seller.as_ref() {
+                        @let (prefix, suffix) = addr_prefix_suffix(seller);
+                        div class="xcp-action-party" {
+                            span class="muted" { "Sold by" }
+                            a class="link mono addr-inline" href=(explorer_path(&format!("/address/{seller}"))) {
+                                span class="addr-prefix" { (prefix) }
+                                span class="addr-suffix" { (suffix) }
+                            }
+                        }
+                    }
+                }
+            }
+            div class=(format!("trace-status {}", status_class)) {
+                span class="trace-status-icon" aria-hidden="true" { (icon_arrow_bend_down_right()) }
+                span class="trace-status-text" { (action.status.clone()) }
+            }
+            @let deltas = xcp_display::transfers_for_action(action, transfers);
+            @if !deltas.is_empty() {
+                div class="xcp-delta-table" {
+                    @for transfer in deltas {
+                        @let (prefix, suffix) = addr_prefix_suffix(&transfer.address);
+                        @let delta = if transfer.incoming {
+                            format!("+{} {}", transfer.amount, transfer.asset)
+                        } else {
+                            format!("-{} {}", transfer.amount, transfer.asset)
+                        };
+                        div class="xcp-delta-row" {
+                            a class="link mono addr-inline" href=(explorer_path(&format!("/address/{}", transfer.address))) {
+                                span class="addr-prefix" { (prefix) }
+                                span class="addr-suffix" { (suffix) }
+                            }
+                            span class=(if transfer.incoming { "xcp-delta-amt plus mono" } else { "xcp-delta-amt minus mono" }) {
+                                (delta)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn rune_balances_list(

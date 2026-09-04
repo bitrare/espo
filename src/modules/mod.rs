@@ -9,3 +9,4 @@ pub mod pizzafun;
 pub mod runes;
 pub mod subfrost;
 pub mod tokendata;
+pub mod xcp;

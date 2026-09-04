@@ -735,11 +735,12 @@ fn search_scripts(base_path_js: &str) -> Markup {
   const iconTextFor = (kind) => {{
     if (kind === 'blocks') return '#';
     if (kind === 'addresses') return '@';
+    if (kind === 'counterparty') return 'X';
     return 'Tx';
   }};
 
   const buildIcon = (group, item) => {{
-    if (group.kind === 'alkanes' || group.kind === 'runes') {{
+    if (group.kind === 'alkanes' || group.kind === 'runes' || group.kind === 'counterparty') {{
       const wrap = document.createElement('span');
       wrap.className = 'alk-icon-wrap search-alk-icon';
       const img = document.createElement('span');

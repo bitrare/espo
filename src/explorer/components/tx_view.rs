@@ -1425,17 +1425,29 @@ pub fn render_alkane_balances(entries: &[BalanceEntry], essentials_mdb: &Mdb) ->
     balances_list(entries, &mut cache, essentials_mdb, false)
 }
 
-fn render_xcp_action(action: &xcp_display::XcpAction, transfers: &[xcp_display::XcpTransfer]) -> Markup {
-    let letter = xcp_display::asset_letter(if action.asset.is_empty() { "X" } else { &action.asset });
-    let asset_label = if action.asset.is_empty() { "Counterparty".to_string() } else { action.asset.clone() };
+fn render_xcp_action(
+    action: &xcp_display::XcpAction,
+    transfers: &[xcp_display::XcpTransfer],
+) -> Markup {
+    let letter =
+        xcp_display::asset_letter(if action.asset.is_empty() { "X" } else { &action.asset });
+    let asset_label =
+        if action.asset.is_empty() { "Counterparty".to_string() } else { action.asset.clone() };
     let asset_href = (!action.asset.is_empty())
         .then(|| explorer_path(&format!("/counterparty/asset/{}", action.asset)));
+    let icon_url = (!action.asset.is_empty())
+        .then(|| crate::modules::xcp::enhanced::for_asset(&action.asset))
+        .flatten()
+        .and_then(|info| info.icon().map(|url| url.to_string()));
     let status_class = if action.success { "success" } else { "failure" };
     html! {
         div class="trace-summary" {
             span class="trace-summary-label" { "Counterparty action:" }
             div class="trace-contract-row" {
-                div class="trace-contract-icon" aria-hidden="true" {
+                div class="trace-contract-icon alk-icon-wrap" aria-hidden="true" {
+                    @if let Some(url) = icon_url.as_deref() {
+                        span class="alk-icon-img" style=(icon_bg_style(url)) {}
+                    }
                     span class="trace-icon-letter" { (letter) }
                 }
                 div class="trace-contract-meta" {

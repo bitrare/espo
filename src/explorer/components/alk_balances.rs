@@ -11,6 +11,7 @@ use crate::modules::essentials::storage::BalanceEntry;
 use crate::modules::runes::storage::{RunesProvider, SchemaRuneId};
 use crate::modules::xcp::core::AddressAssetBalance;
 use crate::modules::xcp::display::asset_letter;
+use crate::modules::xcp::enhanced;
 use crate::runtime::mdb::Mdb;
 
 pub fn render_alkane_balance_cards(entries: &[BalanceEntry], essentials_mdb: &Mdb) -> Markup {
@@ -108,9 +109,14 @@ pub fn render_xcp_balance_cards(entries: &[AddressAssetBalance]) -> Markup {
                     .filter(|name| !name.is_empty())
                     .unwrap_or(entry.asset.as_str());
                 @let letter = asset_letter(&entry.asset).to_string();
+                @let icon_url = enhanced::warm(&entry.asset, entry.description.as_deref())
+                    .and_then(|info| info.icon().map(|url| url.to_string()));
                 div class="alk-card" {
                     div class="alk-line" {
                         div class="alk-icon-wrap" aria-hidden="true" {
+                            @if let Some(url) = icon_url.as_deref() {
+                                span class="alk-icon-img" style=(icon_bg_style(url)) {}
+                            }
                             span class="alk-icon-letter" { (letter) }
                         }
                         span class="alk-amt mono" { (amount) }

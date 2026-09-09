@@ -23,6 +23,7 @@ use serde_json::{Value, json};
 use std::{net::SocketAddr, str::FromStr, sync::Arc};
 use tarpc::context;
 use tokio::net::TcpListener;
+use tower_http::cors::{Any, CorsLayer};
 
 #[derive(Clone)]
 pub struct RpcState {
@@ -1058,7 +1059,8 @@ async fn handle_single_request(
 
 pub async fn run_rpc(registry: RpcRegistry, addr: SocketAddr) -> anyhow::Result<()> {
     let state = Arc::new(RpcState { registry });
-    let app = Router::new().route("/rpc", post(handle_rpc)).with_state(state);
+    let cors = CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any);
+    let app = Router::new().route("/rpc", post(handle_rpc)).layer(cors).with_state(state);
 
     eprintln!("[rpc] listening on {}", addr);
     let listener = TcpListener::bind(addr).await?;

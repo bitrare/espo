@@ -9,10 +9,12 @@ use crate::explorer::components::svg_assets::{
     icon_pager_first, icon_pager_last, icon_pager_left, icon_pager_right,
 };
 use crate::explorer::components::table::holders_table;
+use crate::explorer::components::tx_view::icon_bg_style;
 use crate::explorer::pages::common::format_integer;
 use crate::explorer::paths::explorer_path;
 use crate::modules::xcp::core::{CoreFetch, fetch_path_list};
 use crate::modules::xcp::display::{asset_letter, short_hash};
+use crate::modules::xcp::enhanced;
 
 #[derive(Deserialize)]
 pub struct PageQuery {
@@ -27,14 +29,15 @@ pub async fn xcp_assets_page(Query(q): Query<PageQuery>) -> Response {
     let named = q.named.as_deref() != Some("0");
     let offset = limit.saturating_mul(page.saturating_sub(1));
     let extra = if named { "named=true" } else { "" };
-    let fetched = match tokio::task::spawn_blocking(move || {
-        fetch_path_list("/assets", extra, offset, limit)
-    })
-    .await
-    {
-        Ok(result) => result,
-        Err(_) => return (StatusCode::BAD_GATEWAY, "Counterparty Core unavailable").into_response(),
-    };
+    let fetched =
+        match tokio::task::spawn_blocking(move || fetch_path_list("/assets", extra, offset, limit))
+            .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                return (StatusCode::BAD_GATEWAY, "Counterparty Core unavailable").into_response();
+            }
+        };
     let list = match fetched {
         CoreFetch::Ok(list) => list,
         CoreFetch::NotFound => {
@@ -46,30 +49,45 @@ pub async fn xcp_assets_page(Query(q): Query<PageQuery>) -> Response {
     };
 
     let rows_len = list.items.len();
+    let warm_targets: Vec<(String, String)> = list
+        .items
+        .iter()
+        .filter_map(|row| {
+            let name = row.get("asset").and_then(|v| v.as_str()).filter(|s| !s.is_empty())?;
+            let description = row.get("description").and_then(|v| v.as_str())?;
+            enhanced::json_info_url(description)
+                .map(|_| (name.to_string(), description.to_string()))
+        })
+        .take(16)
+        .collect();
+    if !warm_targets.is_empty() {
+        let _ = tokio::task::spawn_blocking(move || {
+            for (name, description) in warm_targets {
+                let _ = enhanced::warm(&name, Some(&description));
+            }
+        })
+        .await;
+    }
     let rows = list
         .items
         .iter()
         .map(|row| {
-            let name = row
-                .get("asset")
-                .and_then(|v| v.as_str())
-                .unwrap_or("—")
-                .to_string();
-            let longname = row
-                .get("asset_longname")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty());
+            let name = row.get("asset").and_then(|v| v.as_str()).unwrap_or("—").to_string();
+            let longname =
+                row.get("asset_longname").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
             let title = longname.unwrap_or(&name).to_string();
-            let supply = row
-                .get("supply_normalized")
-                .and_then(|v| v.as_str())
-                .unwrap_or("0");
+            let supply = row.get("supply_normalized").and_then(|v| v.as_str()).unwrap_or("0");
             let issuer = row.get("issuer").and_then(|v| v.as_str()).unwrap_or("");
             let locked = row.get("locked").and_then(|v| v.as_bool()).unwrap_or(false);
+            let icon_url =
+                enhanced::cached(&name).and_then(|info| info.icon().map(|url| url.to_string()));
             vec![
                 html! {
                     a class="link" href=(explorer_path(&format!("/counterparty/asset/{name}"))) {
                         span class="alk-icon-wrap" aria-hidden="true" {
+                            @if let Some(url) = icon_url.as_deref() {
+                                span class="alk-icon-img" style=(icon_bg_style(url)) {}
+                            }
                             span class="alk-icon-letter" { (asset_letter(&name)) }
                         }
                         span { (title) }

@@ -40,7 +40,7 @@ use pages::runes::runes_page;
 use pages::search::search;
 use pages::state::ExplorerState;
 use pages::tx::tx_page;
-use pages::xcp_asset::xcp_asset_page;
+use pages::xcp_asset::{xcp_asset_page, xcp_icon};
 use pages::xcp_assets::xcp_assets_page;
 use tokio::net::TcpListener;
 
@@ -71,7 +71,8 @@ pub fn explorer_router(state: ExplorerState) -> Router {
     if crate::modules::xcp::config::XcpConfig::enabled() {
         pages = pages
             .route("/counterparty/assets", get(xcp_assets_page))
-            .route("/counterparty/asset/{asset}", get(xcp_asset_page));
+            .route("/counterparty/asset/{asset}", get(xcp_asset_page))
+            .route("/counterparty/icon/{asset}", get(xcp_icon));
     }
 
     let mut api = Router::new()

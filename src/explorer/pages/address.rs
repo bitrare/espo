@@ -301,12 +301,12 @@ pub async fn address_page(
     let limit = q.limit.unwrap_or(DEFAULT_PAGE_LIMIT).clamp(1, MAX_PAGE_LIMIT);
     let runes_enabled = runes_enabled_from_global_config();
     let xcp_enabled = crate::modules::xcp::config::XcpConfig::enabled();
-    let requested_filter = if (runes_enabled || xcp_enabled) && q.txs.is_none() && q.traces.is_none()
-    {
-        TxFilter::Action
-    } else {
-        TxFilter::from_query(q.txs.as_deref(), q.traces.as_deref())
-    };
+    let requested_filter =
+        if (runes_enabled || xcp_enabled) && q.txs.is_none() && q.traces.is_none() {
+            TxFilter::Action
+        } else {
+            TxFilter::from_query(q.txs.as_deref(), q.traces.as_deref())
+        };
     let tx_filter = match requested_filter {
         TxFilter::Rune if !runes_enabled => TxFilter::Alkane,
         TxFilter::Xcp if !xcp_enabled => {
@@ -460,6 +460,32 @@ pub async fn address_page(
         xcp_txs_t0,
         &format!("xcp_txs={}", xcp_address_txs.len()),
     );
+    if xcp_enabled {
+        let prefetch_balances: Vec<(String, Option<String>)> = xcp_balance_entries
+            .iter()
+            .map(|entry| (entry.asset.clone(), entry.description.clone()))
+            .collect();
+        let prefetch_tx_assets: Vec<String> = xcp_address_txs
+            .iter()
+            .filter_map(|item| crate::modules::xcp::display::view_from_core(&item.raw))
+            .flat_map(|view| {
+                view.actions
+                    .into_iter()
+                    .map(|action| action.asset)
+                    .chain(view.transfers.into_iter().map(|transfer| transfer.asset))
+            })
+            .filter(|asset| !asset.is_empty())
+            .collect();
+        let _ = tokio::task::spawn_blocking(move || {
+            for (asset, description) in prefetch_balances {
+                let _ = crate::modules::xcp::enhanced::warm(&asset, description.as_deref());
+            }
+            for asset in prefetch_tx_assets {
+                let _ = crate::modules::xcp::enhanced::for_asset(&asset);
+            }
+        })
+        .await;
+    }
 
     let chart_tokens_t0 = Instant::now();
     let mut chart_meta_cache: AlkaneMetaCache = HashMap::new();
@@ -715,15 +741,10 @@ pub async fn address_page(
         tx_has_next = (off + tx_renders.len()) < tx_total;
     } else if tx_filter == TxFilter::Xcp {
         let confirmed_total = xcp_address_txs.len();
-        let page_items: Vec<&crate::modules::xcp::core::AddressTransaction> = xcp_address_txs
-            .iter()
-            .skip(confirmed_offset)
-            .take(remaining_slots)
-            .collect();
-        let txids: Vec<Txid> = page_items
-            .iter()
-            .filter_map(|item| Txid::from_str(&item.txid).ok())
-            .collect();
+        let page_items: Vec<&crate::modules::xcp::core::AddressTransaction> =
+            xcp_address_txs.iter().skip(confirmed_offset).take(remaining_slots).collect();
+        let txids: Vec<Txid> =
+            page_items.iter().filter_map(|item| Txid::from_str(&item.txid).ok()).collect();
         let raw_txs_t0 = Instant::now();
         let raw_txs = electrum_like.batch_transaction_get_raw(&txids).unwrap_or_default();
         log_address_page_perf(

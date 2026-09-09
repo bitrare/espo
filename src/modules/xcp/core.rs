@@ -40,6 +40,7 @@ pub struct AddressAssetBalance {
     pub quantity: u128,
     pub quantity_normalized: String,
     pub divisible: bool,
+    pub description: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -52,12 +53,16 @@ pub struct AddressTransaction {
 
 impl AddressAssetBalance {
     pub fn to_api(&self) -> Value {
+        let icon = super::enhanced::warm(&self.asset, self.description.as_deref())
+            .and_then(|info| info.icon().map(|s| s.to_string()));
         json!({
             "asset": self.asset,
             "asset_longname": self.longname,
             "quantity": self.quantity.to_string(),
             "quantity_normalized": self.quantity_normalized,
             "divisible": self.divisible,
+            "description": self.description,
+            "icon": icon,
         })
     }
 }
@@ -99,7 +104,13 @@ pub fn fetch_asset_with(cfg: &XcpConfig, query: &str) -> CoreFetch<Value> {
     last
 }
 
-pub fn fetch_asset_list(asset: &str, suffix: &str, extra: &str, offset: usize, limit: usize) -> CoreFetch<CoreList> {
+pub fn fetch_asset_list(
+    asset: &str,
+    suffix: &str,
+    extra: &str,
+    offset: usize,
+    limit: usize,
+) -> CoreFetch<CoreList> {
     let Some(cfg) = XcpConfig::from_global() else {
         return CoreFetch::Unreachable;
     };
@@ -121,11 +132,7 @@ pub fn fetch_address_balances_filtered(
 
     let (path, extra) = match asset.map(str::trim).filter(|s| !s.is_empty()) {
         Some(asset) => (
-            format!(
-                "/addresses/{}/balances/{}",
-                encode_path(address),
-                encode_path(asset)
-            ),
+            format!("/addresses/{}/balances/{}", encode_path(address), encode_path(asset)),
             String::new(),
         ),
         None => (
@@ -191,7 +198,22 @@ pub fn fetch_address_transactions(address: &str) -> CoreFetch<Vec<AddressTransac
     CoreFetch::Ok(rows.iter().filter_map(parse_address_transaction).collect())
 }
 
-pub fn fetch_path_list(path: &str, extra: &str, offset: usize, limit: usize) -> CoreFetch<CoreList> {
+pub fn fetch_pool(asset_a: &str, asset_b: &str) -> CoreFetch<Value> {
+    let Some(cfg) = XcpConfig::from_global() else {
+        return CoreFetch::Unreachable;
+    };
+    get_result(
+        &cfg,
+        &format!("/pools/{}/{}?verbose=true", encode_path(asset_a), encode_path(asset_b)),
+    )
+}
+
+pub fn fetch_path_list(
+    path: &str,
+    extra: &str,
+    offset: usize,
+    limit: usize,
+) -> CoreFetch<CoreList> {
     let Some(cfg) = XcpConfig::from_global() else {
         return CoreFetch::Unreachable;
     };
@@ -201,7 +223,13 @@ pub fn fetch_path_list(path: &str, extra: &str, offset: usize, limit: usize) -> 
         url.push_str(extra);
     }
     match get_body(&cfg, &url) {
-        CoreFetch::Ok(body) => CoreFetch::Ok(list_from_body(&body)),
+        CoreFetch::Ok(body)
+            if body.get("result").is_some_and(Value::is_array)
+                && body.get("result_count").and_then(Value::as_u64).is_some() =>
+        {
+            CoreFetch::Ok(list_from_body(&body))
+        }
+        CoreFetch::Ok(_) => CoreFetch::Unreachable,
         CoreFetch::NotFound => CoreFetch::NotFound,
         CoreFetch::Unreachable => CoreFetch::Unreachable,
     }
@@ -224,7 +252,13 @@ pub fn fetch_asset_list_with(
         path.push_str(extra);
     }
     match get_body(cfg, &path) {
-        CoreFetch::Ok(body) => CoreFetch::Ok(list_from_body(&body)),
+        CoreFetch::Ok(body)
+            if body.get("result").is_some_and(Value::is_array)
+                && body.get("result_count").and_then(Value::as_u64).is_some() =>
+        {
+            CoreFetch::Ok(list_from_body(&body))
+        }
+        CoreFetch::Ok(_) => CoreFetch::Unreachable,
         CoreFetch::NotFound => CoreFetch::NotFound,
         CoreFetch::Unreachable => CoreFetch::Unreachable,
     }
@@ -273,17 +307,22 @@ fn aggregate_address_balances(rows: &[Value]) -> Vec<AddressAssetBalance> {
             .and_then(|v| v.as_bool())
             .unwrap_or(asset.eq_ignore_ascii_case("XCP"));
         let longname = longname_from_row(row);
+        let description = description_from_row(row);
         let entry = by_asset.entry(asset.to_string()).or_insert_with(|| AddressAssetBalance {
             asset: asset.to_string(),
             longname: longname.clone(),
             quantity: 0,
             quantity_normalized: String::new(),
             divisible,
+            description: description.clone(),
         });
         entry.quantity = entry.quantity.saturating_add(quantity);
         entry.divisible = entry.divisible || divisible;
         if entry.longname.is_none() {
             entry.longname = longname;
+        }
+        if entry.description.is_none() {
+            entry.description = description;
         }
     }
 
@@ -303,6 +342,22 @@ fn aggregate_address_balances(rows: &[Value]) -> Vec<AddressAssetBalance> {
             .then_with(|| a.asset.cmp(&b.asset))
     });
     items
+}
+
+fn description_from_row(row: &Value) -> Option<String> {
+    row.get("description")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            row.get("asset_info")
+                .and_then(|info| info.get("description"))
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+        })
 }
 
 fn longname_from_row(row: &Value) -> Option<String> {
@@ -341,15 +396,9 @@ fn json_u128(value: Option<&Value>) -> u128 {
 }
 
 fn list_from_body(body: &Value) -> CoreList {
-    let items = body
-        .get("result")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let total = body
-        .get("result_count")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(items.len() as u64) as usize;
+    let items = body.get("result").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let total =
+        body.get("result_count").and_then(|v| v.as_u64()).unwrap_or(items.len() as u64) as usize;
     CoreList { items, total }
 }
 
@@ -464,7 +513,7 @@ fn push_unique(out: &mut Vec<String>, value: String) {
     }
 }
 
-fn encode_path(raw: &str) -> String {
+pub(crate) fn encode_path(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     for byte in raw.bytes() {
         match byte {
@@ -489,9 +538,7 @@ fn get_result(cfg: &XcpConfig, path: &str) -> CoreFetch<Value> {
 
 fn get_body(cfg: &XcpConfig, path: &str) -> CoreFetch<Value> {
     let url = format!("{}{path}", cfg.counterparty_api_url);
-    let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_millis(cfg.timeout_ms))
-        .build();
+    let agent = ureq::AgentBuilder::new().timeout(Duration::from_millis(cfg.timeout_ms)).build();
     let response = match agent.get(&url).call() {
         Ok(response) => response,
         Err(ureq::Error::Status(code, _)) if code == 404 => return CoreFetch::NotFound,

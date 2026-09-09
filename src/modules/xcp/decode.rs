@@ -107,7 +107,9 @@ fn op_return_pushes(tx: &Transaction) -> Vec<Vec<u8>> {
                     let mut data = pb.as_bytes().to_vec();
                     for instr in instructions {
                         match instr {
-                            Ok(Instruction::PushBytes(more)) => data.extend_from_slice(more.as_bytes()),
+                            Ok(Instruction::PushBytes(more)) => {
+                                data.extend_from_slice(more.as_bytes())
+                            }
                             _ => {}
                         }
                     }
@@ -169,7 +171,7 @@ mod tests {
         assert_eq!(decoded.message_name, "dispense");
         assert_eq!(decoded.payload, vec![0x00]);
         msg.insert(0, 0);
-        assert!(parse_message(&msg[..4]).is_none());
+        assert!(parse_message(&msg).is_none());
     }
 
     #[test]

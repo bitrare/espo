@@ -1879,6 +1879,12 @@ a:hover {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.alkane-holders-card td:first-child a {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 100%;
+}
 
 .alkane-holders-card col:nth-child(2) {
   width: 220px;
@@ -2598,6 +2604,15 @@ a:hover {
 }
 .xcp-delta-amt.minus {
   color: #ff6b6b;
+}
+.xcp-activity-amt {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 2px;
+}
+.xcp-activity-amt .xcp-delta-amt {
+  font-weight: 600;
 }
 .trace-contract-row {
   display: flex;
@@ -4607,4 +4622,21 @@ a.alkane-method-btn:hover {
   .docs-json-block .json-raw {
     font-size: 12px;
   }
+}
+
+.xcp-asset-media-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-width: 420px;
+  margin-top: 8px;
+}
+
+.xcp-asset-media {
+  display: block;
+  width: 100%;
+  max-height: 360px;
+  object-fit: contain;
+  border-radius: 16px;
+  background: var(--card, #141c24);
 }

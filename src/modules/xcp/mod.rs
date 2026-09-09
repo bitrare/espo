@@ -1,6 +1,11 @@
+pub mod activity;
 pub mod config;
 pub mod core;
 pub mod decode;
 pub mod display;
+pub mod enhanced;
+pub mod history;
 pub mod main;
+pub mod market;
+pub mod market_summary;
 pub mod rpc;

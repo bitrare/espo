@@ -4,6 +4,10 @@ use serde_json::json;
 pub fn register_rpc(reg: RpcNsRegistrar) {
     eprintln!("[RPC::XCP] registering RPC handlers…");
     tokio::spawn(async move {
+        reg.register("get_asset_activity", move |_cx, payload| super::activity::rpc(payload))
+            .await;
+        reg.register("get_asset_history", move |_cx, payload| super::history::rpc(payload))
+            .await;
         reg.register("get_tx", move |_cx, payload| async move {
             let Some(txid) = payload
                 .get("txid")
@@ -46,8 +50,8 @@ pub fn register_rpc(reg: RpcNsRegistrar) {
             let lookup = asset.clone();
             match tokio::task::spawn_blocking(move || super::core::fetch_asset(&lookup)).await {
                 Ok(super::core::CoreFetch::Ok(value)) => {
-                    let name = super::core::asset_name_from_value(&value)
-                        .unwrap_or_else(|| asset.clone());
+                    let name =
+                        super::core::asset_name_from_value(&value).unwrap_or_else(|| asset.clone());
                     let holders = {
                         let asset_name = name.clone();
                         tokio::task::spawn_blocking(move || {
@@ -118,6 +122,79 @@ pub fn register_rpc(reg: RpcNsRegistrar) {
                     json!({ "ok": false, "address": address, "error": "unreachable" })
                 }
                 Err(e) => json!({ "ok": false, "address": address, "error": e.to_string() }),
+            }
+        })
+        .await;
+        reg.register("get_asset_dispenses", move |_cx, payload| async move {
+            let Some(asset) = payload
+                .get("asset")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                return json!({ "ok": false, "error": "asset required" });
+            };
+            let asset = asset.to_string();
+            let limit =
+                payload.get("limit").and_then(|v| v.as_u64()).unwrap_or(5).clamp(1, 50) as usize;
+            let lookup = asset.clone();
+            match tokio::task::spawn_blocking(move || {
+                super::core::fetch_asset_list(
+                    &lookup,
+                    "dispenses",
+                    "sort=block_index:DESC",
+                    0,
+                    limit,
+                )
+            })
+            .await
+            {
+                Ok(super::core::CoreFetch::Ok(list)) => json!({
+                    "ok": true,
+                    "asset": asset,
+                    "result": list.items,
+                    "result_count": list.items.len(),
+                }),
+                Ok(super::core::CoreFetch::NotFound) => {
+                    json!({ "ok": true, "asset": asset, "result": [], "result_count": 0 })
+                }
+                Ok(super::core::CoreFetch::Unreachable) => {
+                    json!({ "ok": false, "asset": asset, "error": "unreachable" })
+                }
+                Err(e) => json!({ "ok": false, "asset": asset, "error": e.to_string() }),
+            }
+        })
+        .await;
+        reg.register("get_asset_market", move |_cx, payload| async move {
+            let Some(asset) = payload
+                .get("asset")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                return json!({ "ok": false, "error": "asset required" });
+            };
+            let asset = asset.to_string();
+            let lookup = asset.clone();
+            match tokio::task::spawn_blocking(move || super::market::fetch_asset_market(&lookup))
+                .await
+            {
+                Ok(super::core::CoreFetch::Ok(market)) => {
+                    let mut value = market.to_api();
+                    let name = asset.clone();
+                    value["summary"] =
+                        tokio::task::spawn_blocking(move || super::market_summary::fetch(&name))
+                            .await
+                            .unwrap_or(json!({"complete":false,"error":"unavailable"}));
+                    value
+                }
+                Ok(super::core::CoreFetch::NotFound) => {
+                    json!({ "ok": false, "asset": asset, "error": "not_found" })
+                }
+                Ok(super::core::CoreFetch::Unreachable) => {
+                    json!({ "ok": false, "asset": asset, "error": "unreachable" })
+                }
+                Err(e) => json!({ "ok": false, "asset": asset, "error": e.to_string() }),
             }
         })
         .await;

@@ -14,9 +14,9 @@ impl XcpConfig {
     }
 
     pub fn from_value(value: &Value) -> Result<Self> {
-        let obj = value.as_object().ok_or_else(|| {
-            anyhow!("xcp config must be an object; expected: {}", Self::spec())
-        })?;
+        let obj = value
+            .as_object()
+            .ok_or_else(|| anyhow!("xcp config must be an object; expected: {}", Self::spec()))?;
 
         let counterparty_api_url = obj
             .get("counterparty_api_url")

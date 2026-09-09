@@ -130,7 +130,7 @@ fn generic_action(message_name: &str, core: Option<&Value>, valid: Option<bool>)
     XcpAction {
         method: message_name.to_string(),
         headline: title_case(message_name),
-        asset: String::new(),
+        asset: first_asset_from_core(core),
         amount: None,
         btc_total: None,
         rate_btc: None,
@@ -149,9 +149,7 @@ pub fn summary_label(xcp: &Value) -> String {
     xcp.get("summary")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
-        .or_else(|| {
-            xcp.get("message_name").and_then(|v| v.as_str()).map(|name| title_case(name))
-        })
+        .or_else(|| xcp.get("message_name").and_then(|v| v.as_str()).map(|name| title_case(name)))
         .unwrap_or_else(|| "Counterparty".to_string())
 }
 
@@ -159,10 +157,11 @@ pub fn transfers_for_action<'a>(
     action: &XcpAction,
     transfers: &'a [XcpTransfer],
 ) -> Vec<&'a XcpTransfer> {
+    let swap = action.method == "pool_swap";
     let mut rows: Vec<&XcpTransfer> = transfers
         .iter()
         .filter(|transfer| {
-            if !action.asset.is_empty() && transfer.asset != action.asset {
+            if !swap && !action.asset.is_empty() && transfer.asset != action.asset {
                 return false;
             }
             action.from.as_deref() == Some(transfer.address.as_str())
@@ -184,6 +183,9 @@ fn movements_from_core(
         return (Vec::new(), Vec::new());
     };
     let success = valid.unwrap_or(true);
+    let has_pool_match = events
+        .iter()
+        .any(|event| event.get("event").and_then(|v| v.as_str()) == Some("POOL_MATCH"));
     let mut closed_machines: HashMap<String, bool> = HashMap::new();
     for event in events {
         if event.get("event").and_then(|v| v.as_str()) != Some("DISPENSER_UPDATE") {
@@ -201,7 +203,7 @@ fn movements_from_core(
     for event in events {
         let kind = event.get("event").and_then(|v| v.as_str()).unwrap_or("");
         let params = event.get("params").unwrap_or(&Value::Null);
-        let asset = string_field(params, "asset").unwrap_or_default();
+        let asset = asset_name_from_params(params).unwrap_or_default();
         let qty = normalized_qty(params);
         let source = string_field(params, "source");
         let destination =
@@ -274,7 +276,16 @@ fn movements_from_core(
                 });
                 push_pair(&mut transfers, source, destination, asset, qty);
             }
+            "POOL_MATCH" => {
+                if let Some((action, legs)) = pool_match_movements(params, success) {
+                    actions.push(action);
+                    transfers.extend(legs);
+                }
+            }
             "CREDIT" => {
+                if has_pool_match {
+                    continue;
+                }
                 if let (Some(dest), Some(amount)) = (destination.or(source), qty) {
                     if !asset.is_empty() {
                         transfers.push(XcpTransfer {
@@ -287,6 +298,9 @@ fn movements_from_core(
                 }
             }
             "DEBIT" => {
+                if has_pool_match {
+                    continue;
+                }
                 if let (Some(src), Some(amount)) = (source.or(destination), qty) {
                     if !asset.is_empty() {
                         transfers.push(XcpTransfer {
@@ -300,7 +314,9 @@ fn movements_from_core(
             }
             "ISSUANCE" => {
                 let headline = match (qty.as_deref(), asset.as_str()) {
-                    (Some(amount), asset) if !asset.is_empty() => format!("{amount} {asset} issued"),
+                    (Some(amount), asset) if !asset.is_empty() => {
+                        format!("{amount} {asset} issued")
+                    }
                     (_, asset) if !asset.is_empty() => format!("{asset} issued"),
                     _ => "Issuance".to_string(),
                 };
@@ -334,7 +350,9 @@ fn movements_from_core(
             "FAIRMINT" => {
                 let dest = destination.or(source);
                 let headline = match (qty.as_deref(), asset.as_str()) {
-                    (Some(amount), asset) if !asset.is_empty() => format!("{amount} {asset} minted"),
+                    (Some(amount), asset) if !asset.is_empty() => {
+                        format!("{amount} {asset} minted")
+                    }
                     _ => "Fairmint".to_string(),
                 };
                 actions.push(XcpAction {
@@ -370,6 +388,62 @@ fn movements_from_core(
     (actions, transfers)
 }
 
+fn pool_match_movements(params: &Value, success: bool) -> Option<(XcpAction, Vec<XcpTransfer>)> {
+    let forward = string_field(params, "forward_asset")?;
+    let backward = string_field(params, "backward_asset")?;
+    let forward_qty = string_field(params, "forward_quantity_normalized").map(|s| trim_qty(&s))?;
+    let backward_qty =
+        string_field(params, "backward_quantity_normalized").map(|s| trim_qty(&s))?;
+    let source = string_field(params, "source")?;
+    let bought_token = is_quote_name(&backward) && !is_quote_name(&forward);
+    let sold_token = is_quote_name(&forward) && !is_quote_name(&backward);
+    let mut headline = if bought_token {
+        format!("Bought {forward_qty} {forward} with {backward_qty} {backward}")
+    } else if sold_token {
+        format!("Sold {backward_qty} {backward} for {forward_qty} {forward}")
+    } else {
+        format!("Swapped {backward_qty} {backward} for {forward_qty} {forward}")
+    };
+    if let Some(fee) = string_field(params, "fee_quantity_normalized").map(|s| trim_qty(&s)) {
+        if fee != "0" {
+            // AMM fee is taken from the inbound (backward) leg, not always XCP.
+            let fee_asset = string_field(params, "fee_asset").unwrap_or_else(|| backward.clone());
+            headline.push_str(&format!(" · {fee} {fee_asset} pool fee"));
+        }
+    }
+    let token = if !is_quote_name(&forward) { forward.clone() } else { backward.clone() };
+    let action = XcpAction {
+        method: "pool_swap".to_string(),
+        headline,
+        asset: token,
+        amount: None,
+        btc_total: None,
+        rate_btc: None,
+        success,
+        status: if success { "Settled".to_string() } else { "Invalid".to_string() },
+        from: Some(source.clone()),
+        to: None,
+        buyer: bought_token.then(|| source.clone()),
+        seller: sold_token.then(|| source.clone()),
+        dispenser_tx: None,
+        machine_closed: false,
+    };
+    let transfers = vec![
+        XcpTransfer {
+            address: source.clone(),
+            asset: forward,
+            amount: forward_qty,
+            incoming: true,
+        },
+        XcpTransfer { address: source, asset: backward, amount: backward_qty, incoming: false },
+    ];
+    Some((action, transfers))
+}
+
+fn is_quote_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case("XCP") || name.eq_ignore_ascii_case("BTC")
+}
+
 fn push_pair(
     transfers: &mut Vec<XcpTransfer>,
     source: Option<String>,
@@ -394,9 +468,49 @@ fn push_pair(
     }
 }
 
+fn first_asset_from_core(core: Option<&Value>) -> String {
+    if let Some(direct) = core.and_then(asset_name_from_params) {
+        return direct;
+    }
+    let Some(events) = core.and_then(|c| c.get("events")).and_then(|v| v.as_array()) else {
+        return String::new();
+    };
+    for event in events {
+        let params = event.get("params").unwrap_or(&Value::Null);
+        if let Some(asset) = asset_name_from_params(params) {
+            return asset;
+        }
+    }
+    String::new()
+}
+
+fn asset_name_from_params(params: &Value) -> Option<String> {
+    const KEYS: [&str; 6] =
+        ["asset", "get_asset", "give_asset", "forward_asset", "asset_a", "asset_b"];
+    let mut fallback = None;
+    for key in KEYS {
+        let Some(name) = string_field(params, key) else {
+            continue;
+        };
+        if name.is_empty() || name.eq_ignore_ascii_case("BTC") {
+            continue;
+        }
+        if name.eq_ignore_ascii_case("XCP") {
+            fallback = fallback.or(Some(name));
+            continue;
+        }
+        return Some(name);
+    }
+    fallback
+}
+
 fn normalized_qty(params: &Value) -> Option<String> {
-    const KEYS: [&str; 4] =
-        ["quantity_normalized", "dispense_quantity_normalized", "give_normalized", "get_normalized"];
+    const KEYS: [&str; 4] = [
+        "quantity_normalized",
+        "dispense_quantity_normalized",
+        "give_normalized",
+        "get_normalized",
+    ];
     for key in KEYS {
         if let Some(qty) = params.get(key).and_then(|v| v.as_str()).map(trim_qty) {
             if !qty.is_empty() {
@@ -418,9 +532,9 @@ fn string_field(value: &Value, key: &str) -> Option<String> {
 
 fn int_field(value: &Value, key: &str) -> Option<u64> {
     value.get(key).and_then(|v| {
-        v.as_u64().or_else(|| v.as_i64().and_then(|n| u64::try_from(n).ok())).or_else(|| {
-            v.as_str().and_then(|s| s.parse::<u64>().ok())
-        })
+        v.as_u64()
+            .or_else(|| v.as_i64().and_then(|n| u64::try_from(n).ok()))
+            .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
     })
 }
 
@@ -482,7 +596,11 @@ pub fn title_case(name: &str) -> String {
 }
 
 pub fn asset_letter(asset: &str) -> char {
-    asset.chars().find(|c| c.is_ascii_alphanumeric()).map(|c| c.to_ascii_uppercase()).unwrap_or('X')
+    asset
+        .chars()
+        .find(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_uppercase())
+        .unwrap_or('X')
 }
 
 pub fn short_hash(hash: &str) -> String {
@@ -534,5 +652,74 @@ mod tests {
         assert_eq!(action.buyer.as_deref(), Some("bc1pbuyer"));
         assert_eq!(action.seller.as_deref(), Some("1dispenser"));
         assert!(action.machine_closed);
+    }
+
+    #[test]
+    fn pool_match_shows_user_buy_and_deltas() {
+        let core = json!({
+            "transaction_type": "order",
+            "valid": true,
+            "source": "bc1pzmkd2zs4y47aggezal2yj8djpp2lht80gv8dfzy4cnvf3yh35t0sde2nyd",
+            "events": [
+                {
+                    "event": "OPEN_ORDER",
+                    "params": {
+                        "get_asset": "MSGA",
+                        "give_asset": "XCP",
+                        "source": "bc1pzmkd2zs4y47aggezal2yj8djpp2lht80gv8dfzy4cnvf3yh35t0sde2nyd"
+                    }
+                },
+                {
+                    "event": "POOL_MATCH",
+                    "params": {
+                        "source": "bc1pzmkd2zs4y47aggezal2yj8djpp2lht80gv8dfzy4cnvf3yh35t0sde2nyd",
+                        "forward_asset": "MSGA",
+                        "backward_asset": "XCP",
+                        "forward_quantity_normalized": "245192.64660789",
+                        "backward_quantity_normalized": "5.00000000",
+                        "fee_quantity_normalized": "0.02500000"
+                    }
+                }
+            ]
+        });
+        let view = view_from_core(&core).expect("xcp");
+        assert_eq!(view.actions.len(), 1);
+        let action = &view.actions[0];
+        assert_eq!(action.method, "pool_swap");
+        assert_eq!(action.headline, "Bought 245192.64660789 MSGA with 5 XCP · 0.025 XCP pool fee");
+        assert_eq!(action.asset, "MSGA");
+        assert_eq!(
+            action.buyer.as_deref(),
+            Some("bc1pzmkd2zs4y47aggezal2yj8djpp2lht80gv8dfzy4cnvf3yh35t0sde2nyd")
+        );
+        let deltas = transfers_for_action(action, &view.transfers);
+        assert_eq!(deltas.len(), 2);
+        assert!(deltas[0].incoming);
+        assert_eq!(deltas[0].asset, "MSGA");
+        assert_eq!(deltas[0].amount, "245192.64660789");
+        assert!(!deltas[1].incoming);
+        assert_eq!(deltas[1].asset, "XCP");
+        assert_eq!(deltas[1].amount, "5");
+    }
+
+    #[test]
+    fn order_uses_get_asset_for_icon() {
+        let core = json!({
+            "transaction_type": "order",
+            "valid": true,
+            "source": "bc1qissuer",
+            "events": [
+                {
+                    "event": "OPEN_ORDER",
+                    "params": {
+                        "get_asset": "MSGA",
+                        "give_asset": "XCP",
+                        "source": "bc1qissuer"
+                    }
+                }
+            ]
+        });
+        let view = view_from_core(&core).expect("xcp");
+        assert_eq!(view.actions[0].asset, "MSGA");
     }
 }

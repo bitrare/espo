@@ -54,7 +54,9 @@ impl EspoModule for Xcp {
                 eprintln!("[xcp] no-op index; adopting essentials tip {tip}");
             }
             None => {
-                eprintln!("[xcp] essentials tip unavailable; get_index_height will stay unset until a block is seen");
+                eprintln!(
+                    "[xcp] essentials tip unavailable; get_index_height will stay unset until a block is seen"
+                );
             }
         }
     }

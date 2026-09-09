@@ -1786,7 +1786,7 @@ fn docs_modules() -> Vec<ModuleDoc> {
         ModuleDoc {
             slug: "xcp-rpc",
             title: "Counterparty JSON-RPC",
-            intro: "Thin Counterparty overlay. Espo does not re-index the XCP ledger; xcp.get_tx, xcp.get_asset, and xcp.get_address_balances read a local Counterparty Core API and the explorer also RC4-decodes classic OP_RETURN payloads.",
+            intro: "Thin Counterparty overlay. Espo does not re-index the XCP ledger; xcp.get_tx, xcp.get_asset, xcp.get_address_balances, xcp.get_asset_dispenses, and xcp.get_asset_market read a local Counterparty Core API and the explorer also RC4-decodes classic OP_RETURN payloads.",
             methods: vec![
                 rpc_doc(
                     "xcp.get_tx",
@@ -1850,6 +1850,65 @@ fn docs_modules() -> Vec<ModuleDoc> {
                             "quantity_normalized": "1312.00000000",
                             "divisible": true
                         }]
+                    }),
+                ),
+                rpc_doc(
+                    "xcp.get_asset_dispenses",
+                    "Newest confirmed BTC dispenses for a Counterparty asset, newest block first. Used for last-sale prices such as XCP. Fail-open when Core is unreachable.",
+                    json!({ "asset": "XCP", "limit": 5 }),
+                    json!({
+                        "ok": true,
+                        "asset": "XCP",
+                        "result_count": 1,
+                        "result": [{
+                            "asset": "XCP",
+                            "dispense_quantity_normalized": "6",
+                            "btc_amount_normalized": "0.000579",
+                            "block_index": 965540
+                        }]
+                    }),
+                ),
+                rpc_doc(
+                    "xcp.get_asset_history",
+                    "Paginated native Counterparty records with all original verbose fields, message indexes, normalized quantities, statuses and transaction references. Types: issuances, sends (including enhanced/MPMA/UTXO send types), dispensers, dispenses, orders, matches, dividends, destructions, subassets, fairminters, fairmints, credits, debits, pool_matches, pool_deposits, pool_withdrawals, pool_history. Pool routes accept quote_asset (default XCP). Status defaults to all; orders: open/filled/cancelled/expired; matches: completed/pending/expired; dispensers: open/closing/closed/open_empty_address. Limit 1..200 (default 50), offset 0..10000000. Total is the node total; result_count is this page. Unsupported/unreachable routes return ok:false, never a fabricated empty success. Non-pool routes use node-native history order, explicitly newest block first where supported.",
+                    json!({"asset":"DJPEPE","type":"orders","status":"all","offset":0,"limit":50}),
+                    json!({"ok":true,"asset":"DJPEPE","type":"orders","status":"all","quote_asset":"XCP","offset":0,"limit":50,"total":323,"result_count":1,"has_more":true,"result":[{"status":"cancelled","give_asset":"XCP","give_quantity_normalized":"400.00000000","get_asset":"DJPEPE","get_quantity_normalized":"1"}]}),
+                ),
+                rpc_doc(
+                    "xcp.get_asset_activity",
+                    "Recent unified activity: all, trades, sends, dispenses, issuances, orders, dispensers, dividends, destructions, fairminters, fairmints, credits, debits, pool_deposits or pool_withdrawals. All/trades are a newest-250-record window (offset below 250); use get_asset_history for unrestricted native pagination. Limit 1..200. Each record preserves the original message, so several sends/fills in one transaction remain separate. Orders and dispensers are current-state records dated by the node-reported block, not a complete status-change timeline; credits/debits expose ledger actions such as cancellations and refunds. A failed source returns ok:false rather than silently dropping data.",
+                    json!({"asset":"DJPEPE","type":"all","offset":0,"limit":50}),
+                    json!({"ok":true,"asset":"DJPEPE","type":"all","offset":0,"limit":50,"total":250,"recent_window":250,"has_more":true,"result":[{"action":"Orders","block_index":959105,"block_time":1784702010,"tx_hash":"85e7a7afd1ac0d1346305dc7dd58a20c4f92cdba15fe9fdd04c9415908f0c985","record":{"status":"cancelled"}}]}),
+                ),
+                rpc_doc(
+                    "xcp.get_asset_market",
+                    "Latest observed XCP/BTC trade price across pool, completed DEX matches and BTC dispenses, with a reserve spot fallback. The summary adds original-currency volumes (including non-XCP/BTC quotes), last trades by currency, best open DEX bids/asks, escrow, open order/dispenser counts, resolved dispenser BTC floor and active months. Summary cache: 60 seconds; at most 2000 rows per source. Inspect complete, trade_history_complete, listings_complete and sources before treating aggregates as lifetime totals. Sources: completed matches, dispenses, asset/XCP pool swaps, open orders and open dispensers. Price calculations are display estimates. No historical USD conversion or off-chain trades; XCP/BTC conversion is an indicative last-dispense rate. Other AMM pairs are available through get_asset_history. Existing top-level price fields remain available; summary volumes keep currencies separate.",
+                    json!({ "asset": "MSGA" }),
+                    json!({
+                        "ok": true,
+                        "asset": "MSGA",
+                        "quote_asset": "XCP",
+                        "price": "0.00002039",
+                        "price_btc": "0.000000002243",
+                        "price_sats": 0,
+                        "icon": "https://xcp.fun/icon/MSGA",
+                        "spot": {
+                            "quote_asset": "XCP",
+                            "price": "0.00002044216596",
+                            "reserve_base": "32895186.37312087",
+                            "reserve_quote": "672.44885897"
+                        },
+                        "last_trade": {
+                            "venue": "pool",
+                            "side": "sell",
+                            "quote_asset": "XCP",
+                            "price": "0.00002039",
+                            "base_amount": "245192.64660789",
+                            "quote_amount": "5",
+                            "block_index": 965410
+                        },
+                        "summary": {"complete":true,"trade_history_complete":true,"listings_complete":true,"open_orders":3,"open_dispensers":0,"order_escrow":"3","volumes":[{"quote_asset":"XCP","asset_quantity":"2","quote_quantity":"8200","trades":2}],"best_asks":[{"quote_asset":"XCP","price":"4100"}],"sources":[{"type":"matches","status":"completed","total":2,"loaded":2,"complete":true}]},
+                        "venues": { "pool_matches": 44, "dex_matches": 2, "dispenses": 0 }
                     }),
                 ),
             ],

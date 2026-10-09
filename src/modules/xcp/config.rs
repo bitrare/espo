@@ -6,11 +6,12 @@ use serde_json::Value;
 pub struct XcpConfig {
     pub counterparty_api_url: String,
     pub timeout_ms: u64,
+    pub history_url: Option<String>,
 }
 
 impl XcpConfig {
     pub fn spec() -> &'static str {
-        r#"{ "counterparty_api_url": "http://127.0.0.1:4100/v2", "timeout_ms": 4000 }"#
+        r#"{ "counterparty_api_url": "http://127.0.0.1:4100/v2", "timeout_ms": 4000, "history_url": "http://127.0.0.1:9093" }"#
     }
 
     pub fn from_value(value: &Value) -> Result<Self> {
@@ -29,7 +30,12 @@ impl XcpConfig {
 
         let timeout_ms = obj.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(4000).max(200);
 
-        Ok(Self { counterparty_api_url, timeout_ms })
+        let history_url = obj
+            .get("history_url")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().trim_end_matches('/').to_owned())
+            .filter(|s| !s.is_empty());
+        Ok(Self { counterparty_api_url, timeout_ms, history_url })
     }
 
     pub fn from_global() -> Option<Self> {

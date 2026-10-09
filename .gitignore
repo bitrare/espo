@@ -100,3 +100,5 @@ db-old-2
 mbkp
 db-prod
 db-runes-old-prod
+
+!src/bin/espo_xcp_history.rs

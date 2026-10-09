@@ -14,3 +14,4 @@ pub mod state;
 pub mod tx;
 pub mod xcp_asset;
 pub mod xcp_assets;
+pub mod xcp_numbering;

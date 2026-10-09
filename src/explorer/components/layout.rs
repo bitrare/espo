@@ -220,6 +220,7 @@ pub fn layout_with_meta(
                                 @if faucet_enabled {
                                     a class="navlink" href=(explorer_path("/faucet")) { "Faucet" }
                                 }
+                                @if crate::modules::xcp::config::XcpConfig::enabled() { a class="navlink" href=(explorer_path("/counterparty/numbering")) { "Numbering" } }
                                 a class="navlink" href=(explorer_path("/docs")) { "Docs" }
                             }
                             div class="nav-actions" {
@@ -239,6 +240,7 @@ pub fn layout_with_meta(
                                 @if faucet_enabled {
                                     a class="nav-menu-link" href=(explorer_path("/faucet")) { "Faucet" }
                                 }
+                                @if crate::modules::xcp::config::XcpConfig::enabled() { a class="nav-menu-link" href=(explorer_path("/counterparty/numbering")) { "Numbering" } }
                                 a class="nav-menu-link" href=(explorer_path("/docs")) { "Docs" }
                             }
                         }

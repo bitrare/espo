@@ -1,0 +1,26 @@
+[Unit]
+Description=Espo isolated Counterparty history and numbering
+After=network.target counterparty-server.service
+
+[Service]
+Type=simple
+DynamicUser=yes
+StateDirectory=espo-xcp-history
+WorkingDirectory=/var/lib/espo-xcp-history
+ExecStart=/var/www/espo-xcp/target/release/espo-xcp-history --data-dir /var/lib/espo-xcp-history --listen 127.0.0.1:9093
+Restart=on-failure
+RestartSec=15
+CPUQuota=100%
+MemoryHigh=2G
+MemoryMax=3G
+IOWeight=10
+Nice=10
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

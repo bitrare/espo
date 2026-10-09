@@ -302,6 +302,7 @@ pub async fn xcp_asset_page(
                 div class="xui-title" {
                     h1 { (title.clone()) }
                     div class="xui-tags" {
+                        @if !record.divisible { a class="xui-badge" href=(explorer_path(&format!("/counterparty/numbering?asset={}",record.name))) { "Unit numbering" } }
                         span class="xui-badge" { (if record.locked {"Locked supply"} else {"Unlocked supply"}) }
                         span class="xui-badge" { (if record.divisible {"Divisible"} else {"Indivisible"}) }
                         @if let Some(time)=record.first_issuance_time { span class="xui-muted" { "Issued " (date_label(Some(time))) } }

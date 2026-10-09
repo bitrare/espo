@@ -4,6 +4,12 @@ use serde_json::json;
 pub fn register_rpc(reg: RpcNsRegistrar) {
     eprintln!("[RPC::XCP] registering RPC handlers…");
     tokio::spawn(async move {
+        for method in super::numbering_client::METHODS {
+            reg.register(method, move |_cx, payload| {
+                super::numbering_client::query(method, payload)
+            })
+            .await;
+        }
         reg.register("get_asset_activity", move |_cx, payload| super::activity::rpc(payload))
             .await;
         reg.register("get_asset_history", move |_cx, payload| super::history::rpc(payload))

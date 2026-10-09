@@ -8,4 +8,5 @@ pub mod history;
 pub mod main;
 pub mod market;
 pub mod market_summary;
+pub mod numbering_client;
 pub mod rpc;

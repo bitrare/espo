@@ -71,6 +71,7 @@ pub fn explorer_router(state: ExplorerState) -> Router {
     if crate::modules::xcp::config::XcpConfig::enabled() {
         pages = pages
             .route("/counterparty/assets", get(xcp_assets_page))
+            .route("/counterparty/numbering", get(pages::xcp_numbering::xcp_numbering_page))
             .route("/counterparty/asset/{asset}", get(xcp_asset_page))
             .route("/counterparty/icon/{asset}", get(xcp_icon));
     }

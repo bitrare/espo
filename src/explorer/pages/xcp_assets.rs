@@ -126,6 +126,7 @@ pub async fn xcp_assets_page(Query(q): Query<PageQuery>) -> Response {
         html! {
             div class="row" {
                 h1 class="h1" { "Counterparty assets" }
+                a class="pill" href=(explorer_path("/counterparty/numbering")) { "How unit numbering works" }
                 div class="order-control" {
                     @if named {
                         a class="pill" href=(explorer_path(&format!("/counterparty/assets?page=1&limit={limit}&named=0"))) { "All assets" }

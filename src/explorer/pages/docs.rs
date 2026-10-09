@@ -1914,6 +1914,49 @@ fn docs_modules() -> Vec<ModuleDoc> {
             ],
         },
         ModuleDoc {
+            slug: "xcp-numbering",
+            title: "Counterparty unit numbering",
+            intro: "Read-only access to the independent XCP history service. The complete method explanation is /counterparty/numbering. The worker has its own database and checkpoint; it never causes an Alkanes resync. All data methods return context with network, ruleset, source commit, phase, completeness and numbering height/hash. By default incomplete or stale data is an error; allow_partial:true explicitly selects the reported historical checkpoint. verified is false until the separate legacy and live audit gates are complete. Serials, range endpoints and quantities are decimal strings. Cursors are tied to the exact projection generation and query; stale_cursor requires restarting pagination. Limit 1..200. Histories may return an empty filtered page with has_more:true because scans are bounded. Typed locations distinguish addresses, UTXOs, orders, pending BTC matches, dispensers, pool reserves, fairmint escrow, retired and destroyed units.",
+            methods: vec![
+                rpc_doc(
+                    "xcp.get_numbering_status",
+                    "Returns archive download progress, validated archive tip, numbering tip, freshness, source adapter identity and pause diagnostics. A successful status response does not imply complete numbering. No parameters. The worker's private GET /status returns the same status shape; private POST /query accepts {method,params} without the xcp. prefix and is loopback-only.",
+                    json!({}),
+                    json!({"ok":true,"network":"mainnet","ruleset":"nakamoto-stack-v1","phase":"downloading_history","complete":false,"verified":false,"numbering_tip":null,"archive_tip":null,"download":{"downloaded_events":1000}}),
+                ),
+                rpc_doc(
+                    "xcp.get_asset_units",
+                    "Returns paginated current directed serial ranges for a canonical asset or alias. asset is required. Optional limit, cursor and allow_partial. Range order is by lowest serial; stack_position is the zero-based position of this directed run in its location's ordered stack. Never sort a holder's units by serial to infer transfer order. This endpoint includes escrow and terminal locations.",
+                    json!({"asset":"RAREPEPE","limit":20,"allow_partial":true}),
+                    json!({"ok":true,"context":{"ruleset":"nakamoto-stack-v1","complete":false,"numbering_tip":{"height":725934}},"asset":"RAREPEPE","items":[{"asset":"RAREPEPE","location":{"kind":"address","id":"1Example","controller":"1Example"},"range":{"first":"5","last":"3","quantity":"3"},"stack_position":"0"}],"has_more":false,"next_cursor":null}),
+                ),
+                rpc_doc(
+                    "xcp.get_unit",
+                    "Looks up one serial at the reported checkpoint, including UTXO, escrow, retired or destroyed locations. asset and serial are required; serial is a positive decimal string. Optional allow_partial. No fabricated owner is returned for units not issued at the checkpoint. Issuance rights and controller addresses are separate from unit locations.",
+                    json!({"asset":"RAREPEPE","serial":"1","allow_partial":true}),
+                    json!({"ok":true,"context":{"ruleset":"nakamoto-stack-v1","complete":false},"asset":"RAREPEPE","serial":"1","location":{"kind":"utxo","id":"txid:0","controller":"bc1example"}}),
+                ),
+                rpc_doc(
+                    "xcp.get_unit_history",
+                    "Returns issuance and movement legs containing one serial, oldest first, with event indexes and nullable transaction hashes. asset and serial required; optional limit, cursor and allow_partial. A movement's ranges include the requested serial and may include other units that moved with it. Several legs in a transaction remain distinct. System events need not have a transaction hash; event_reference preserves the Core operation reference, including older transactions or match IDs.",
+                    json!({"asset":"RAREPEPE","serial":"1","limit":50,"allow_partial":true}),
+                    json!({"ok":true,"context":{"ruleset":"nakamoto-stack-v1","complete":false},"items":[{"asset":"RAREPEPE","block":428919,"event_index":"3378670","leg":0,"tx_hash":null,"reason":"issuance","from":null,"to":{"kind":"address","id":"1Example"},"ranges":[{"first":"1","last":"300","quantity":"300"}]}],"has_more":false,"next_cursor":null}),
+                ),
+                rpc_doc(
+                    "xcp.get_address_units",
+                    "Returns numbered ranges at locations controlled by an address, including its wrapped UTXOs and order/dispenser escrow. address required; optional asset, limit, cursor and allow_partial. A pool's LP holder is not assigned ownership of specific reserve units. This endpoint reports controller association, not just a spendable address balance; inspect location.kind.",
+                    json!({"address":"1Example","asset":"RAREPEPE","limit":50,"allow_partial":true}),
+                    json!({"ok":true,"context":{"ruleset":"nakamoto-stack-v1","complete":false},"items":[{"asset":"RAREPEPE","location":{"kind":"order","id":"order_txid","controller":"1Example"},"range":{"first":"300","last":"151","quantity":"150"},"stack_position":"0"}],"has_more":false,"next_cursor":null}),
+                ),
+                rpc_doc(
+                    "xcp.get_transfer_units",
+                    "Returns all numbered movement ranges associated with a transaction, ordered by event index and leg. txid is required (64 hexadecimal characters); optional asset, limit, cursor and allow_partial. Does not deduplicate by transaction hash. Includes later block actions whose event_reference is this transaction. tx_hash is the current transaction when present; event_reference retains the source operation reference.",
+                    json!({"txid":"4c9d2979685dc172864a5c00811f44034e7966bc6555dcc272531c4bdd304405","asset":"RAREPEPE","allow_partial":true}),
+                    json!({"ok":true,"context":{"ruleset":"nakamoto-stack-v1","complete":false},"items":[{"asset":"RAREPEPE","block":428919,"event_index":"3378670","leg":0,"reason":"issuance","from":null,"to":{"kind":"address","id":"1Example"},"ranges":[{"first":"1","last":"300","quantity":"300"}]}],"has_more":false,"next_cursor":null}),
+                ),
+            ],
+        },
+        ModuleDoc {
             slug: "oyl-http",
             title: "Oyl-Compatible HTTP API",
             intro: "POST endpoints served by the oylapi module for wallet and AMM clients.",

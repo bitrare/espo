@@ -2760,7 +2760,11 @@ async fn refresh_memory_mempool(rpc: &CoreClient, network: Network) -> Result<()
     };
     let cfg = get_config().mempool.clone();
     let mut entries: Vec<(&String, &VerboseMempoolEntry)> = verbose.iter().collect();
-    if cfg.max_txs > 0 && entries.len() > cfg.max_txs {
+    // max_txs is a real cap. Truncating the snapshot and then refusing to
+    // delete (clear protection) let the in-memory set grow without bound and
+    // the exclusive mempool lock filled the accept queue.
+    let capped = cfg.max_txs > 0 && entries.len() > cfg.max_txs;
+    if capped {
         entries.sort_by(|(_, a), (_, b)| {
             let a_fee = a.fees.as_ref().and_then(|f| f.base).map(btc_to_sat).unwrap_or(0) as f64;
             let b_fee = b.fees.as_ref().and_then(|f| f.base).map(btc_to_sat).unwrap_or(0) as f64;
@@ -2794,7 +2798,9 @@ async fn refresh_memory_mempool(rpc: &CoreClient, network: Network) -> Result<()
     let clear_active = clear_until.map(|until| until > now).unwrap_or(false);
     let sharp_drop = current_count > 20_000
         && canonical.len().saturating_mul(100) <= current_count.saturating_mul(80);
-    let skip_removal = sharp_drop || (clear_active && canonical.len() < current_count);
+    // A short canonical set after our own cap is not a partial RPC response.
+    let skip_removal = !capped
+        && (sharp_drop || (clear_active && canonical.len() < current_count));
     let mut protected_refresh = false;
     if skip_removal {
         protected_refresh = true;
@@ -2895,6 +2901,9 @@ fn start_mempool_hydration(network: Network) {
             handles.push(std::thread::spawn(move || {
                 let rpc = get_bitcoind_rpc_client();
                 loop {
+                    if is_shutdown_requested() {
+                        break;
+                    }
                     let idx = next.fetch_add(1, Ordering::SeqCst);
                     let Some(txid) = txids.get(idx).copied() else { break };
                     let already_loaded = mempool_state()
